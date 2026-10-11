@@ -1,0 +1,98 @@
+/* =====================================================================
+   MatCalc – ukázkové skripty (načtou se jen při úplně prvním spuštění)
+   Grafy jsou přímo v kódu (blok %% Grafy), stejně jako v MATLABu.
+   ===================================================================== */
+(function () {
+  'use strict';
+  const MC = (window.MC = window.MC || {});
+
+  MC.examples = [
+    {
+      name: 'Aktivace Na-24',
+      code: [
+        '%% Neutronová aktivace 23Na(n,γ)24Na',
+        '% Nárůst aktivity při ozařování. Hodnoty jsou ilustrační.',
+        '% Středník na konci řádku potlačí výpis. ⌥↵ spustí jen sekci s kurzorem.',
+        '',
+        '%% Vstupní data',
+        'm     = 0.1;            % hmotnost vzorku NaCl [g]',
+        'M     = 58.44;          % molární hmotnost NaCl [g/mol]',
+        'NA    = 6.022e23;       % Avogadrova konstanta [1/mol]',
+        'sigma = 0.53e-24;       % účinný průřez (n,γ) pro 23Na [cm^2]',
+        'phi   = 1e12;           % hustota toku tepelných neutronů [1/(cm^2·s)]',
+        'T12   = 14.997 * 3600;  % poločas 24Na [s]',
+        '',
+        '%% Výpočet',
+        'N     = m / M * NA            % počet jader 23Na',
+        'lam   = log(2) / T12;         % rozpadová konstanta [1/s]',
+        'A_sat = N * sigma * phi       % saturovaná aktivita [Bq]',
+        '',
+        't_oz  = 0:2:72;                                     % doba ozařování [h]',
+        'A     = A_sat * (1 - exp(-lam * t_oz * 3600)) / 1e6;  % aktivita [MBq]',
+        'podil = A / (A_sat / 1e6) * 100;                      % podíl saturace [%]',
+        '',
+        'A_8h  = A_sat * (1 - exp(-lam * 8 * 3600)) / 1e6      % aktivita po 8 h [MBq]',
+        'fprintf("Po 8 h ozařování: %.1f MBq (%.0f %% saturace)\\n", A_8h, A_8h / (A_sat/1e6) * 100)',
+        '',
+        '%% Grafy',
+        'figure',
+        'plot(t_oz, A, \'LineWidth\', 1.5)',
+        'title(\'Nárůst aktivity ^{24}Na při ozařování\')',
+        'xlabel(\'Doba ozařování [h]\')',
+        'ylabel(\'Aktivita [MBq]\')',
+        'grid on',
+        '',
+      ].join('\n'),
+    },
+    {
+      name: 'Ztráty na vedení 22 kV',
+      code: [
+        '%% Ztráty na vedení 22 kV – jednotky a porovnání dvou průřezů',
+        '% Jednotka se píše za číslo (22 kV, 12 km), převod přes "to".',
+        '% Odpory vodičů jsou přibližné, jen pro ilustraci.',
+        '',
+        'U      = 22 kV;               % sdružené napětí',
+        'L      = 12 km;               % délka vedení',
+        'cosphi = 0.95;',
+        '',
+        'R_95  = 0.306 ohm/km * L      % AlFe 95/15, jeden vodič',
+        'R_150 = 0.194 ohm/km * L      % AlFe 150/25, jeden vodič',
+        '',
+        '%% Ztráty v závislosti na proudu',
+        'I = linspace(20 A, 300 A, 29);       % proud vedením',
+        'P = sqrt(3) * U * I * cosphi;        % přenášený činný výkon',
+        '',
+        'dP_95  = 3 * R_95  * I.^2;           % ztráty ve třech vodičích',
+        'dP_150 = 3 * R_150 * I.^2;',
+        'ztraty_95  = dP_95  ./ P * 100;      % ztráty v % přenášeného výkonu',
+        'ztraty_150 = dP_150 ./ P * 100;',
+        '',
+        'P_max  = max(P) to MW',
+        'uspora = (max(dP_95) - max(dP_150)) to kW   % úspora při 300 A',
+        '',
+        '%% Grafy',
+        'figure',
+        'plot(I, ztraty_95, \'-o\', \'DisplayName\', \'AlFe 95/15\')',
+        'hold on',
+        'plot(I, ztraty_150, \'-o\', \'DisplayName\', \'AlFe 150/25\')',
+        'title(\'Ztráty v závislosti na proudu\')',
+        'xlabel(\'Proud I [A]\')',
+        'ylabel(\'Ztráty [% přenášeného výkonu]\')',
+        'legend(\'Location\', \'northwest\')',
+        'grid on',
+        '',
+      ].join('\n'),
+    },
+  ];
+
+  MC.newScriptTemplate = [
+    '% Nový skript',
+    '% Řádek se středníkem na konci se nevypíše, bez středníku se zobrazí výsledek.',
+    '% Řádek „%% Název“ začne novou sekci – ⌥↵ spustí jen ji.',
+    '',
+    'a = 2;',
+    'b = 3;',
+    'c = a^2 + b^2',
+    '',
+  ].join('\n');
+})();

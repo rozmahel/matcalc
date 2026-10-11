@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MatCalc</title>
+  <meta name="description" content="Lehká kalkulačka ve stylu MATLABu na rychlé, opakované výpočty a grafy.">
+  <meta name="theme-color" content="#eef1f4">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="icons/favicon-16.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="MatCalc">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="stylesheet" href="vendor/codemirror/codemirror.css">
+  <link rel="stylesheet" href="vendor/codemirror/show-hint.css">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- ===== Horní lišta (toolstrip) ===== -->
+  <header class="toolstrip">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="currentColor"/><path d="M5 21c3 0 4-10 7-10s4 10 7 10 4-10 8-10" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/></svg>
+      <span>MatCalc</span>
+    </div>
+
+    <div class="ts-group">
+      <div class="ts-buttons">
+        <button class="ts-btn" id="btnNew" data-icon="newfile" title="Nový skript">Nový</button>
+        <button class="ts-btn" id="btnOpen" data-icon="open" title="Otevřít soubor .m, .txt nebo zálohu .json">Otevřít</button>
+        <button class="ts-btn" id="btnSaveM" data-icon="download" title="Stáhnout skript jako .m (grafy jsou v kódu, jde spustit v MATLABu)">Uložit .m</button>
+      </div>
+      <div class="ts-label">Soubor</div>
+    </div>
+
+    <div class="ts-group">
+      <div class="ts-buttons">
+        <button class="ts-btn ts-run" id="btnRun" data-icon="run" title="Spustit celý skript (⌘↵ / Ctrl+↵ / F5)">Spustit</button>
+        <button class="ts-btn ts-sec" id="btnRunSec" data-icon="runsec" title="Spustit sekci s kurzorem – od %% po další %% (⌥↵)">Sekce</button>
+        <div class="ts-stack">
+          <button class="ts-btn-sm" id="btnRunSel" data-icon="runsel" title="Spustit označený text nebo aktuální řádek (F9 / ⇧⌘↵)">Spustit výběr</button>
+          <label class="ts-check" title="Skript se přepočítá sám chvíli po dopsání">
+            <input type="checkbox" id="chkAuto"> Přepočítávat při psaní
+          </label>
+        </div>
+      </div>
+      <div class="ts-label">Spustit</div>
+    </div>
+
+    <div class="ts-group">
+      <div class="ts-buttons">
+        <button class="ts-btn" id="btnClear" data-icon="eraser" title="Smazat všechny proměnné (clear)">Vyčistit</button>
+        <div class="ts-stack">
+          <label class="ts-field">Formát
+            <select id="selFormat" title="Počet platných číslic ve výpisu">
+              <option value="short">short g (5 číslic)</option>
+              <option value="long">long g (15 číslic)</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <div class="ts-label">Proměnné</div>
+    </div>
+
+    <div class="ts-group">
+      <div class="ts-buttons">
+        <button class="ts-btn" id="btnNewFig" data-icon="chart" title="Přidat nový graf (figure do bloku %% Grafy)">Nový graf</button>
+        <button class="ts-btn" id="btnFigSettings" data-icon="sliders" title="Zobrazit / skrýt nastavení grafu">Nastavení</button>
+      </div>
+      <div class="ts-label">Graf</div>
+    </div>
+
+    <div class="ts-spacer"></div>
+    <button class="ts-btn" id="btnHelp" data-icon="help" title="Nápověda k syntaxi a ovládání">Nápověda</button>
+  </header>
+
+  <!-- ===== Hlavní plocha ===== -->
+  <main id="main">
+    <aside id="sidebar" class="panel">
+      <div class="panel-head">
+        <span class="ph-title">Skripty</span>
+        <span class="ph-actions"><button class="icon-btn" id="btnNew2" data-icon="plus" title="Nový skript"></button></span>
+      </div>
+      <ul id="scriptList" class="script-list"></ul>
+      <div class="sidebar-foot">
+        <button class="link-btn" id="btnBackup" title="Stáhnout všechny skripty jako jeden soubor .json">Záloha všeho</button>
+        <button class="link-btn" id="btnRestore" title="Načíst skripty ze zálohy .json">Obnovit</button>
+      </div>
+    </aside>
+
+    <div class="gutter gv" data-gutter="sidebar" title="Táhni pro změnu šířky"></div>
+
+    <section id="colLeft" class="col">
+      <div id="editorPanel" class="panel">
+        <div class="panel-head">
+          <span class="ph-title">Editor – <b id="editorTitle"></b></span>
+          <span class="ph-actions"><span class="ph-hint">⌘↵ spustit · ⌥↵ sekce</span></span>
+        </div>
+        <div id="editorHost"></div>
+      </div>
+      <div class="gutter gh" data-gutter="editor"></div>
+      <div id="cmdPanel" class="panel">
+        <div class="panel-head">
+          <span class="ph-title">Command Window</span>
+          <span class="ph-actions"><button class="icon-btn" id="btnClc" data-icon="eraser" title="Vyčistit okno (clc)"></button></span>
+        </div>
+        <div id="cmdOut" aria-live="polite"></div>
+        <div id="cmdPrompt">
+          <span class="prompt-sign">&gt;&gt;</span>
+          <input id="cmdInput" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Příkaz" placeholder="napiš výraz a stiskni Enter, např. A_sat / 1e6">
+        </div>
+      </div>
+    </section>
+
+    <div class="gutter gv" data-gutter="left"></div>
+
+    <section id="colRight" class="col">
+      <div id="wsPanel" class="panel">
+        <div class="panel-head">
+          <span class="ph-title">Workspace <span class="ph-count" id="wsCount"></span></span>
+          <span class="ph-actions">
+            <span class="ph-hint">pravý klik = do grafu</span>
+            <button class="icon-btn" id="btnClear2" data-icon="eraser" title="Smazat všechny proměnné (clear)"></button>
+          </span>
+        </div>
+        <div class="ws-wrap">
+          <table id="wsTable">
+            <thead><tr>
+              <th class="c-name" data-sort title="Kliknutím přepneš řazení (pořadí definice / abecedně)">Název <span id="wsSortInd">↓</span></th>
+              <th class="c-val">Hodnota</th>
+              <th class="c-size">Velikost</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+          <div id="wsEmpty" class="empty-note">Workspace je prázdný. Spusť skript (⌘↵).</div>
+        </div>
+      </div>
+      <div class="gutter gh" data-gutter="ws"></div>
+      <div id="figPanel" class="panel">
+        <div class="panel-head fig-head">
+          <div id="figTabs" class="fig-tabs"></div>
+          <span class="ph-actions">
+            <button class="icon-btn" id="btnCopyImg" data-icon="copy" title="Kopírovat obrázek grafu do schránky"></button>
+            <button class="icon-btn" id="btnCopyData" data-icon="table" title="Kopírovat data grafu (pro Excel)"></button>
+            <button class="txt-btn" id="btnPng" title="Stáhnout PNG">PNG</button>
+            <button class="txt-btn" id="btnSvg" title="Stáhnout SVG (vektorově)">SVG</button>
+            <button class="icon-btn" id="btnFigSettings2" data-icon="sliders" title="Nastavení grafu"></button>
+          </span>
+        </div>
+        <div class="fig-body">
+          <div class="fig-plot-wrap">
+            <div id="figDraft" hidden>
+              <span class="fd-dot"></span><span class="fd-text"></span>
+              <button class="btn primary" id="fdSave" title="Zapsat změny z panelu do kódu (Enter v poli, ⌘S)">Zapsat do kódu</button>
+              <button class="btn" id="fdCancel" title="Zahodit změny (Esc v poli)">Zrušit</button>
+            </div>
+            <div id="figNotice" hidden></div>
+            <div id="figPlot"></div>
+            <div id="figEmpty" class="fig-empty">
+              <div class="fe-art" aria-hidden="true">
+                <svg viewBox="0 0 120 70"><path d="M8 6v56h106" fill="none" stroke="currentColor" stroke-width="2"/><path d="M14 54c18 0 22-36 40-36s22 26 34 26 14-14 20-18" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-dasharray="5 5" stroke-linecap="round"/></svg>
+              </div>
+              <div class="fe-msg"></div>
+              <p class="muted">Víc proměnných vybereš s ⌘ / Ctrl nebo Shift.</p>
+            </div>
+          </div>
+          <aside id="figSettings" aria-label="Nastavení grafu">
+            <div id="fsBar">
+              <span class="fsb-text">Změny se ukážou v náhledu</span>
+              <button class="btn" id="fsCancel" title="Zahodit změny (Esc v poli)" disabled>Zrušit</button>
+              <button class="btn primary" id="fsSave" title="Zapsat změny do kódu (Enter v poli, ⌘S)" disabled>Zapsat do kódu</button>
+            </div>
+            <div id="fsBody"></div>
+          </aside>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="statusbar">
+    <span id="stStatus">Připraveno</span>
+    <span class="st-spacer"></span>
+    <span id="stCursor"></span>
+    <span id="stSave"></span>
+  </footer>
+
+  <div id="ctxMenu" class="ctx" hidden role="menu"></div>
+  <div id="modalRoot"></div>
+  <input type="file" id="fileInput" accept=".m,.txt,.json" multiple hidden>
+
+  <script src="vendor/math.min.js"></script>
+  <script src="vendor/plotly-basic.min.js"></script>
+  <script src="vendor/codemirror/codemirror.js"></script>
+  <script src="vendor/codemirror/octave.js"></script>
+  <script src="vendor/codemirror/matchbrackets.js"></script>
+  <script src="vendor/codemirror/closebrackets.js"></script>
+  <script src="vendor/codemirror/comment.js"></script>
+  <script src="vendor/codemirror/active-line.js"></script>
+  <script src="vendor/codemirror/show-hint.js"></script>
+  <script src="js/engine.js"></script>
+  <script src="js/graphics.js"></script>
+  <script src="js/examples.js"></script>
+  <script src="js/plot.js"></script>
+  <script src="js/plotcode.js"></script>
+  <script src="js/app.js"></script>
+  <script src="js/pwa.js"></script>
+</body>
+</html>
