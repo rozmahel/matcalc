@@ -13,6 +13,13 @@
    Všechny operace mění pole řádků (lines, číslováno od 0) na místě;
    čísla řádků v příkazech jsou od 1 jako v editoru.
 
+   Křivky: každá dvojice X–Y v řádku plot je jedna křivka s vlastní X
+   (proměnná, index vzorku nebo čas z periody). Jeden řádek může mít víc
+   dvojic – plot(t, y, 'o', tHladka, yfit, '-'). Volby pro celý řádek
+   ('Color', 'LineWidth', 'DisplayName'…) platí v MATLABu pro všechny
+   dvojice, proto křivka s takovou volbou dostane vlastní řádek.
+   Jména křivek z řádku s víc dvojicemi jsou v legend('a', 'b', …).
+
    Vedlejší osa Y: skupina se dělí příkazy „yyaxis left / right“ na úseky.
    Řádky před prvním yyaxis patří levé straně. ylabel, ylim a YScale se
    píšou do úseku své strany, ostatní (title, xlabel, legend…) platí pro
@@ -65,22 +72,35 @@
   const byFn = (g, fns) => g.stmts.filter((s) => s.call && [].concat(fns).includes(s.call.fn));
 
   /* ---------- modely jednoduchých řádků ---------- */
+  const isData = (x) => x.kind !== 'str' && x.kind !== 'cellstr';
+  const ident = (name) => ({ kind: 'ident', text: name, value: name });
+  /**
+   * plot(x1, y1, 'o', x2, y2, '-', 'Volba', hodnota…) -> { fn, pairs: [{ x, y, spec }], opts }
+   * Každá dvojice je jedna křivka (x = null -> index vzorku). Dělí se stejně jako v graphics.js
+   * (doPlot): dva datové argumenty za sebou jsou x a y, za nimi může být styl.
+   */
   function plotModel(st) {
     if (!st || !st.simple || !G.PLOT_FNS.has(st.call.fn)) return null;
     const a = st.call.args;
+    if (a.length && a[0].kind === 'ident' && a[0].text === 'gca') return null;
     let i = 0;
-    const data = [];
-    while (i < a.length && a[i].kind !== 'str' && a[i].kind !== 'cellstr') data.push(a[i++]);
-    if (data.length < 1 || data.length > 2) return null;
-    let spec = {};
-    if (i < a.length && a[i].kind === 'str' && G.parseSpec(a[i].value)) { spec = G.parseSpec(a[i].value); i++; }
+    const pairs = [];
+    while (i < a.length && isData(a[i])) {
+      const a1 = a[i++];
+      let a2 = null;
+      if (i < a.length && isData(a[i])) a2 = a[i++];
+      let spec = {};
+      if (i < a.length && a[i].kind === 'str' && G.parseSpec(a[i].value)) { spec = G.parseSpec(a[i].value); i++; }
+      pairs.push({ x: a2 ? a1 : null, y: a2 || a1, spec });
+    }
+    if (!pairs.length) return null;
     const opts = [];
     for (; i < a.length; i += 2) {
       if (a[i].kind !== 'str' || !a[i + 1]) return null;
       opts.push([a[i].value, a[i + 1]]);
     }
-    const m = { fn: st.call.fn, x: data.length === 2 ? data[0] : null, y: data[data.length - 1], spec, opts };
-    m.editable = m.y.kind === 'ident' && (!m.x || m.x.kind === 'ident');
+    const m = { fn: st.call.fn, pairs, opts };
+    m.editable = pairs.every((p) => p.y.kind === 'ident' && (!p.x || p.x.kind === 'ident'));
     return m;
   }
   const getOpt = (m, name) => { const o = m.opts.find((p) => lc(p[0]) === lc(name)); return o ? o[1] : null; };
@@ -90,12 +110,23 @@
     const arg = { kind: 'expr', text };
     if (k >= 0) m.opts[k] = [m.opts[k][0], arg]; else m.opts.push([name, arg]);
   }
+  // styl jako v MATLABu: barva, značka, čára – 'ro-', 'o', '-'
+  const specText = (sp) => (sp.color || '') + (sp.marker || '') + (sp.ls || '');
+  // řádek, ve kterém zbyla jedna dvojice: styl '-' doplněný kvůli dvojicím je výchozí, nemusí tam být
+  function tidy(m) {
+    if (m.pairs.length === 1 && specText(m.pairs[0].spec) === '-') m.pairs[0].spec = {};
+    return m;
+  }
+  // víc dvojic v řádku: každá má styl (aspoň '-'), aby bylo vidět, kde dvojice končí (i u indexu vzorku)
   function serializePlot(m) {
     const args = [];
-    if (m.x) args.push(m.x.text);
-    args.push(m.y.text);
-    const sp = (m.spec.color || '') + (m.spec.ls || '') + (m.spec.marker || '');
-    if (sp) args.push(q(sp));
+    const multi = m.pairs.length > 1;
+    m.pairs.forEach((p) => {
+      if (p.x) args.push(p.x.text);
+      args.push(p.y.text);
+      const sp = specText(p.spec) || (multi ? '-' : '');
+      if (sp) args.push(q(sp));
+    });
     m.opts.forEach(([n, v]) => { args.push(q(n)); args.push(v.text); });
     return m.fn + '(' + args.join(', ') + ')';
   }
@@ -237,11 +268,6 @@
   }
   const deleteLine = (lines, lineNo) => lines.splice(lineNo - 1, 1);
 
-  function lastPlotLine(g) {
-    const p = byFn(g, ['plot', 'semilogx', 'semilogy', 'loglog']);
-    return p.length ? p[p.length - 1].endLine : null;
-  }
-
   // vloží řádek na konec skupiny (za poslední příkaz – pozdější příkaz v MATLABu vyhrává)
   function appendToGroup(lines, g, text) { insertAfter(lines, g.last, text, indentOf(lines, g)); }
 
@@ -337,8 +363,9 @@
     });
   }
 
-  // legenda: viditelnost a poloha. Při zapnutí doplní DisplayName podle názvu proměnné.
-  function setLegend(lines, fig, visible, location) {
+  // legenda: viditelnost a poloha. Při zapnutí doplní jména podle názvu proměnné
+  // (DisplayName, nebo legend('a', 'b', …), když je v některém řádku víc dvojic). names = jména čar grafu.
+  function setLegend(lines, fig, visible, location, names) {
     let { g } = ctxFor(lines, fig);
     const legs = byFn(g, 'legend').filter((s) => legendModel(s));
     if (!visible) {
@@ -357,52 +384,226 @@
     if (!m.labels.length) {
       // popisky z názvů proměnných, ať legenda neukazuje data1, data2
       ({ g } = ctxFor(lines, fig));
+      const multi = g.stmts.some((s) => { const pm = plotModel(s); return pm && pm.editable && pm.pairs.length > 1; });
+      if (multi && names && names.length) { writeLabels(lines, fig, names); return; }
       g.stmts.forEach((s) => {
         const pm = plotModel(s);
-        if (pm && pm.editable && !getOpt(pm, 'DisplayName')) { setOpt(pm, 'DisplayName', q(pm.y.text)); replaceStmt(lines, s, serializePlot(pm)); }
+        if (pm && pm.editable && pm.pairs.length === 1 && !getOpt(pm, 'DisplayName')) { setOpt(pm, 'DisplayName', q(pm.pairs[0].y.text)); replaceStmt(lines, s, serializePlot(pm)); }
       });
     }
   }
 
+  /* ---------- křivky (dvojice X–Y) ---------- */
+  const refRe = (n) => new RegExp('(^|[^A-Za-z0-9_])' + n + '([^A-Za-z0-9_]|$)');
+  const timeDefs = (g) => g.stmts.map(timeModel).filter(Boolean);
+  const timeCode = (name, ref, dt) => name + ' = (0:numel(' + ref + ')-1)*' + dt;
+  const letterOf = (hex) => Object.keys(G.COLOR_LETTERS).find((k) => G.COLOR_LETTERS[k].toLowerCase() === String(hex).toLowerCase()) || null;
+  // index čáry v grafu (fig.ax.lines) pro j-tou dvojici řádku – podle něj se páruje s popisky legendy
+  const lineIndex = (fig, stLine, j) => { const ls = fig.ax.lines.filter((ln) => ln.line === stLine); return ls[j] ? fig.ax.lines.indexOf(ls[j]) : -1; };
+
   /**
-   * Změna jedné křivky (řádek plot). ch = { y, x, color, ls, marker, width, label, labelIndex }
-   * color: '#RRGGBB' (písmeno r/g/b… se použije, když barva přesně odpovídá)
+   * Křivky skupiny v pořadí kódu: { ord, st, j, m, p, ro }. ord = pořadí křivky ve skupině
+   * (nezmění se rozdělením řádku ani vložením časového vektoru), j = index dvojice v řádku.
+   * Řádek plot, který panel neumí (výrazy, matice…), je jedna položka s ro = true.
    */
-  function setSeries(lines, fig, stmtLine, ch) {
+  function curvesOf(g) {
+    const out = [];
+    g.stmts.forEach((st) => {
+      if (!isPlot(st)) return;
+      const m = plotModel(st);
+      if (!m || !m.editable) { out.push({ ord: out.length, st, j: 0, m, p: null, ro: true }); return; }
+      m.pairs.forEach((p, j) => out.push({ ord: out.length, st, j, m, p, ro: false }));
+    });
+    return out;
+  }
+  function curveAt(g, ord) {
+    const c = curvesOf(g)[ord];
+    if (!c || c.ro) throw new Error('Křivka je ručně psaná – uprav ji v editoru');
+    return c;
+  }
+
+  // X jedné křivky: { kind: 'index' } | { kind: 'var', name } | { kind: 'time', name, dt, ref, st }
+  function xOf(g, p) {
+    if (!p.x) return { kind: 'index' };
+    const tm = timeDefs(g).find((t) => t.name === p.x.text);
+    if (tm) return { kind: 'time', name: tm.name, dt: tm.dt, ref: tm.ref, st: tm.st };
+    return { kind: 'var', name: p.x.text };
+  }
+  // X poslední upravitelné křivky (nová křivka ho převezme); null = graf bez křivek
+  function lastX(g) {
+    const cs = curvesOf(g).filter((c) => !c.ro);
+    return cs.length ? xOf(g, cs[cs.length - 1].p) : null;
+  }
+  // společná X všech křivek ('' = index, null = různé / žádné) – pro menu Workspace
+  function commonX(g) {
+    const cs = curvesOf(g).filter((c) => !c.ro);
+    if (!cs.length) return null;
+    const xs = new Set(cs.map((c) => (c.p.x ? c.p.x.text : '')));
+    return xs.size === 1 ? [...xs][0] : null;
+  }
+
+  // je název použitý ve skupině i jinde než v dané křivce? (vlastní definice se nepočítá)
+  function usedElsewhere(g, name, stLine, j) {
+    const re = refRe(name);
+    return g.stmts.some((s) => {
+      const tm = timeModel(s);
+      if (tm && tm.name === name) return false;
+      if (s.line === stLine) {
+        const m = plotModel(s);
+        if (m) return m.pairs.some((p, k) => k !== j && ((p.x && p.x.text === name) || p.y.text === name)) || m.opts.some((o) => re.test(o[1].text));
+      }
+      return re.test(s.code);
+    });
+  }
+
+  // volný název pro časový vektor: t, t_<y>, t2, t3… (ne ve workspace ani přiřazený v kódu)
+  function freeTimeName(lines, y, taken) {
+    const used = new Set(taken || []);
+    lines.forEach((l) => { const m = l.match(/^\s*([A-Za-z_]\w*)\s*=(?!=)/); if (m) used.add(m[1]); });
+    const cands = ['t', 't_' + y];
+    for (let k = 2; k < 100; k++) cands.push('t' + k);
+    return cands.find((c) => !used.has(c) && c !== y);
+  }
+
+  /**
+   * X a/nebo Y jedné křivky. xs = { kind: 'index' } | { kind: 'var', name } | { kind: 'time', dt }
+   * (undefined = beze změny), y = název proměnné (undefined = beze změny).
+   * Čas z periody je vlastní vektor křivky t = (0:numel(y)-1)*dt na řádku před jejím plot.
+   * Vektor sdílený víc křivkami (starší grafy) se při změně nepřepíše – křivka dostane nový,
+   * aby perioda jedné křivky neměnila ostatní. Se změnou Y jde časový vektor s ní (délka podle Y).
+   * taken = názvy ve workspace (aby nový vektor nepřepsal jinou proměnnou).
+   */
+  function setCurveData(lines, fig, ord, xs, y, taken) {
     const { g } = ctxFor(lines, fig);
-    const st = g.stmts.find((s) => s.line === stmtLine);
-    const m = plotModel(st);
-    if (!m || !m.editable) throw new Error('Řádek ' + stmtLine + ' je ručně psaný – uprav ho v editoru');
-    if (ch.y !== undefined) m.y = { kind: 'ident', text: ch.y };
-    if (ch.x !== undefined) m.x = ch.x ? { kind: 'ident', text: ch.x } : null;
+    const c = curveAt(g, ord);
+    const p = c.m.pairs[c.j];
+    const cur = xOf(g, p);
+    if (y !== undefined) p.y = ident(y);
+    const yName = p.y.text;
+    if (xs === undefined && cur.kind === 'time' && y !== undefined) xs = { kind: 'time', dt: cur.dt };
+    let rewrite = null;
+    let add = null;
+    if (xs) {
+      if (xs.kind === 'index') p.x = null;
+      else if (xs.kind === 'var') p.x = ident(xs.name);
+      else if (cur.kind === 'time' && !usedElsewhere(g, cur.name, c.st.line, c.j)) rewrite = { st: cur.st, name: cur.name, dt: xs.dt };
+      else { const name = freeTimeName(lines, yName, taken); p.x = ident(name); add = { name, dt: xs.dt }; }
+    }
+    if (p.x && p.x.text === yName) throw new Error('„' + yName + '“ nemůže být na ose X i Y stejné křivky');
+    replaceStmt(lines, c.st, serializePlot(c.m));
+    if (rewrite) replaceStmt(lines, rewrite.st, timeCode(rewrite.name, yName, rewrite.dt));
+    if (add) insertAfter(lines, c.st.line - 1, timeCode(add.name, yName, add.dt) + ';', indentOf(lines, g));
+    try { dropUnusedTime(lines, fig); } catch (e) { /* skupina se posunula – časový vektor zůstane */ }
+  }
+
+  /**
+   * Křivku z řádku s víc dvojicemi dá na vlastní řádek plot – kvůli volbám, které v MATLABu
+   * platí pro celý řádek ('Color', 'LineWidth', 'DisplayName'…). Řádek se rozdělí na části
+   * před, křivku a za, takže pořadí křivek (barvy, legenda) zůstane; volby řádku dostane každá část.
+   */
+  function isolate(lines, fig, ord) {
+    const { g } = ctxFor(lines, fig);
+    const c = curveAt(g, ord);
+    const m = c.m;
+    if (m.pairs.length < 2) return;
+    const parts = [m.pairs.slice(0, c.j), [m.pairs[c.j]], m.pairs.slice(c.j + 1)]
+      .filter((ps) => ps.length).map((ps) => tidy({ fn: m.fn, pairs: ps.map((p) => Object.assign({}, p, { spec: Object.assign({}, p.spec) })), opts: m.opts.slice() }));
+    const ind = (lines[c.st.line - 1].match(/^\s*/) || [''])[0];
+    replaceStmt(lines, c.st, serializePlot(parts[0]));
+    const add = [];
+    if (!holdBefore(g, c.st.line + 1)) add.push(ind + 'hold on');
+    parts.slice(1).forEach((pm) => add.push(ind + serializePlot(pm)));
+    lines.splice(c.st.line, 0, ...add);
+  }
+
+  // poslední legenda s popisky ({ s, m }) nebo null
+  function labelsLegend(g) {
+    const l = byFn(g, 'legend').map((s) => ({ s, m: legendModel(s) })).filter((o) => o.m && o.m.labels.length).pop();
+    return l || null;
+  }
+  /**
+   * Jména křivek do legend('a', 'b', …) – když je v řádku plot víc dvojic, DisplayName nejde
+   * (platil by pro všechny). DisplayName u upravitelných řádků se smaže, jména jsou teď v legendě.
+   */
+  function writeLabels(lines, fig, labels) {
+    const { g } = ctxFor(lines, fig);
+    g.stmts.forEach((s) => {
+      const pm = plotModel(s);
+      if (pm && pm.editable && getOpt(pm, 'DisplayName')) { setOpt(pm, 'DisplayName', null); replaceStmt(lines, s, serializePlot(pm)); }
+    });
+    const legs = byFn(g, 'legend').filter((s) => { const lm = legendModel(s); return lm && (!lm.keyword || lm.keyword === 'show'); });
+    const st = legs[legs.length - 1];
+    const m = st ? legendModel(st) : { labels: [], opts: [], keyword: null, cell: false };
+    m.keyword = null;
+    m.labels = labels.slice();
+    // popisky platí pro křivky nakreslené před legend – za ní nesmí být další plot (např. vpravo)
+    if (st && g.stmts.some((s) => isPlot(s) && s.line > st.line) && st.single) {
+      deleteLine(lines, st.line);
+      appendToGroup(lines, ctxFor(lines, fig).g, serializeLegend(m));
+    } else if (st) replaceStmt(lines, st, serializeLegend(m));
+    else appendToGroup(lines, g, serializeLegend(m));
+  }
+  // popisky doplněné do délky n jmény křivek (names = jména čar grafu v pořadí)
+  function padLabels(labels, n, names) {
+    while (labels.length < n) labels.push((names && names[labels.length]) || 'data' + (labels.length + 1));
+    return labels;
+  }
+
+  /**
+   * Vzhled a název jedné křivky. ch = { color, ls, marker, width, label, labelIndex, defName, names, legendOn }
+   * color: '#RRGGBB' (písmeno r/g/b… se použije, když barva přesně odpovídá), '' = automaticky.
+   * label: s popisky v legend(…) se mění popisek, u samostatného řádku DisplayName, u řádku
+   * s víc dvojicemi a zapnutou legendou se jména přesunou do legend(…).
+   */
+  function setSeries(lines, fig, ord, ch) {
+    let { g } = ctxFor(lines, fig);
+    let c = curveAt(g, ord);
+    const leg = labelsLegend(g);
+    const lettered = ch.color !== undefined && (!ch.color || letterOf(ch.color));
+    const needOwn = c.m.pairs.length > 1 && (
+      (ch.color !== undefined && (!lettered || getOpt(c.m, 'Color'))) ||
+      ((ch.ls !== undefined || ch.marker !== undefined) && (getOpt(c.m, 'LineStyle') || getOpt(c.m, 'Marker'))) ||
+      ch.width !== undefined ||
+      (ch.label !== undefined && !leg && !ch.legendOn));
+    if (needOwn) { isolate(lines, fig, ord); ({ g } = ctxFor(lines, fig)); c = curveAt(g, ord); }
+    const m = c.m;
+    const p = m.pairs[c.j];
     if (ch.color !== undefined) {
-      const letter = Object.keys(G.COLOR_LETTERS).find((k) => G.COLOR_LETTERS[k].toLowerCase() === String(ch.color).toLowerCase());
-      if (letter) { m.spec.color = letter; setOpt(m, 'Color', null); } else { delete m.spec.color; setOpt(m, 'Color', ch.color ? q(ch.color.toUpperCase()) : null); }
+      const letter = ch.color ? letterOf(ch.color) : null;
+      if (letter) { p.spec.color = letter; setOpt(m, 'Color', null); } else { delete p.spec.color; setOpt(m, 'Color', ch.color ? q(ch.color.toUpperCase()) : null); }
     }
     if (ch.ls !== undefined || ch.marker !== undefined) {
-      let ls = ch.ls !== undefined ? ch.ls : (getOpt(m, 'LineStyle') ? getOpt(m, 'LineStyle').text.replace(/'/g, '') : m.spec.ls || (m.spec.marker ? 'none' : '-'));
-      let mk = ch.marker !== undefined ? ch.marker : (m.spec.marker || 'none');
+      const lsOpt = getOpt(m, 'LineStyle');
+      const ls = ch.ls !== undefined ? ch.ls : (lsOpt ? lsOpt.text.replace(/'/g, '') : p.spec.ls || (p.spec.marker ? 'none' : '-'));
+      let mk = ch.marker !== undefined ? ch.marker : (p.spec.marker || 'none');
       if (ls === 'none' && mk === 'none') mk = 'o';
       setOpt(m, 'LineStyle', null);
       setOpt(m, 'Marker', null);
-      delete m.spec.ls;
-      delete m.spec.marker;
-      if (mk !== 'none') { m.spec.marker = mk; if (ls !== 'none') m.spec.ls = ls; } else if (ls !== '-') m.spec.ls = ls;
+      delete p.spec.ls;
+      delete p.spec.marker;
+      if (mk !== 'none') { p.spec.marker = mk; if (ls !== 'none') p.spec.ls = ls; } else if (ls !== '-') p.spec.ls = ls;
     }
     if (ch.width !== undefined) {
       const w = Number(String(ch.width).replace(',', '.'));
       setOpt(m, 'LineWidth', Number.isFinite(w) && w > 0 && w !== 0.5 ? fmtNum(w) : null);
     }
     let legendEdit = null;
+    let newLabels = null;
     if (ch.label !== undefined) {
-      const leg = byFn(g, 'legend').map((s) => ({ s, m: legendModel(s) })).filter((o) => o.m && o.m.labels.length).pop();
-      if (leg && ch.labelIndex !== undefined && ch.labelIndex < leg.m.labels.length) {
-        leg.m.labels[ch.labelIndex] = ch.label;
+      const k = ch.labelIndex;
+      const text = ch.label === '' ? ch.defName || '' : ch.label;
+      if (leg && k !== undefined && k >= 0) {
+        padLabels(leg.m.labels, k, ch.names);
+        leg.m.labels[k] = text;
         legendEdit = leg;
+      } else if (m.pairs.length > 1 && k !== undefined && k >= 0) {
+        newLabels = padLabels((ch.names || []).slice(), k + 1, ch.names);
+        newLabels[k] = text;
       } else setOpt(m, 'DisplayName', ch.label === '' ? null : q(ch.label));
     }
-    replaceStmt(lines, st, serializePlot(m));
+    replaceStmt(lines, c.st, serializePlot(m));
     if (legendEdit) replaceStmt(lines, legendEdit.s, serializeLegend(legendEdit.m));
+    if (newLabels) writeLabels(lines, fig, newLabels);
   }
 
   function deleteStmt(lines, lineNo, fig) {
@@ -410,17 +611,31 @@
     if (fig) cleanupRight(lines, fig);
   }
 
+  // odebere křivku: dvojici z řádku (řádek zmizí s poslední dvojicí) a její popisek v legendě
+  function deleteCurve(lines, fig, ord) {
+    const { g } = ctxFor(lines, fig);
+    const c = curvesOf(g)[ord];
+    if (!c) return;
+    const leg = labelsLegend(g);
+    const idx = lineIndex(fig, c.st.line, c.j);
+    if (!c.ro && leg && idx >= 0 && idx < leg.m.labels.length) { leg.m.labels.splice(idx, 1); replaceStmt(lines, leg.s, serializeLegend(leg.m)); }
+    if (c.ro || c.m.pairs.length === 1) deleteLine(lines, c.st.line);
+    else { c.m.pairs.splice(c.j, 1); replaceStmt(lines, c.st, serializePlot(tidy(c.m))); }
+    cleanupRight(lines, fig);
+    try { dropUnusedTime(lines, fig); } catch (e) { /* graf zmizel */ }
+  }
+
   /**
    * Přesune řádek plot na levou / pravou osu Y (yyaxis). Na pravou ho dá za poslední
    * křivku vpravo (nebo za „yyaxis right“, případně ho na konec skupiny přidá),
-   * na levou za poslední křivku vlevo. Když vpravo nic nezbude, pravá osa zmizí.
+   * na levou za poslední křivku vlevo. Vrací nové číslo řádku.
    */
-  function setSide(lines, fig, stmtLine, side) {
+  function moveSide(lines, fig, stmtLine, side) {
     let { g } = ctxFor(lines, fig);
     const st = g.stmts.find((s) => s.line === stmtLine);
     if (!st || !plotModel(st) || !st.single) throw new Error('Řádek ' + stmtLine + ' je ručně psaný – uprav ho v editoru');
     const sm = sideMap(g);
-    if (sm.get(st) === side) return;
+    if (sm.get(st) === side) return stmtLine;
     if (g.stmts.some((s) => isYy(s) && !yyWord(s))) throw new Error('Ve skupině je ručně psaný příkaz yyaxis – stranu změň v editoru');
     if (st.line === g.start) throw new Error('Graf začíná tímto řádkem – přidej nad něj „figure“, pak jde křivka přesunout');
     const text = lines[st.line - 1];
@@ -434,7 +649,7 @@
     if (plots.length) at = plots[plots.length - 1].endLine;
     else if (side === 'right') {
       const yy = g.stmts.filter((s) => yyWord(s) === 'right');
-      if (!yy.length) { insertAfter(lines, g.last, ['yyaxis right', plain], ind); return; }
+      if (!yy.length) { insertAfter(lines, g.last, ['yyaxis right', plain], ind); return g.last + 2; }
       at = yy[yy.length - 1].endLine;
     } else {
       // za úvodní figure / hold / yyaxis left na začátku skupiny
@@ -443,7 +658,7 @@
       at = g.stmts[k].endLine;
       if (sm2.get(g.stmts[k]) !== 'left') {
         const yl = g.stmts.filter((s) => yyWord(s) === 'left');
-        if (!yl.length) { insertAfter(lines, g.last, ['yyaxis left', plain], ind); return; }
+        if (!yl.length) { insertAfter(lines, g.last, ['yyaxis left', plain], ind); return g.last + 2; }
         at = yl[yl.length - 1].endLine;
       }
     }
@@ -452,6 +667,40 @@
     if (plots.length && !holdBefore(g, at + 1)) add.push(ind + 'hold on');
     add.push(text);
     lines.splice(at, 0, ...add);
+    return at + add.length;
+  }
+
+  /**
+   * Křivka na levou / pravou osu Y. Z řádku s víc dvojicemi se nejdřív oddělí na vlastní řádek.
+   * Popisek v legend(…) se přesune s ní. Když vpravo nic nezůstane, pravá osa zmizí.
+   */
+  function setSide(lines, fig, ord, side) {
+    let { g } = ctxFor(lines, fig);
+    let c = curveAt(g, ord);
+    if (sideOf(g, c.st) === side) return;
+    const idx = lineIndex(fig, c.st.line, c.j);
+    const leg0 = labelsLegend(g);
+    const label = leg0 && idx >= 0 && idx < leg0.m.labels.length ? leg0.m.labels[idx] : null;
+    let from = c.st.line;
+    if (c.m.pairs.length > 1) {
+      // dvojice ven z řádku na vlastní řádek hned pod ním, odtud se přesune (bez zbytečného hold on)
+      const own = tidy({ fn: c.m.fn, pairs: c.m.pairs.splice(c.j, 1), opts: c.m.opts.slice() });
+      replaceStmt(lines, c.st, serializePlot(tidy(c.m)));
+      insertAfter(lines, c.st.line, serializePlot(own), (lines[c.st.line - 1].match(/^\s*/) || [''])[0]);
+      from = c.st.line + 1;
+    }
+    const at = moveSide(lines, fig, from, side);
+    if (label !== null) {
+      ({ g } = ctxFor(lines, fig));
+      const lg = labelsLegend(g);
+      if (lg) {
+        const before = fig.ax.lines.filter((ln) => ln.line < g.start).length + curvesOf(g).filter((x) => x.st.line < at).length;
+        const labels = lg.m.labels.slice();
+        labels.splice(idx, 1);
+        labels.splice(Math.min(before, labels.length), 0, label);
+        writeLabels(lines, fig, labels);
+      }
+    }
     if (side === 'left') cleanupRight(lines, fig);
   }
 
@@ -473,87 +722,75 @@
     del.map((s) => s.line).sort((a, b) => b - a).forEach((l) => deleteLine(lines, l));
   }
 
-  // společná osa X jednoduchých řádků plot ('' = index, null = různé / žádné)
-  function commonX(g) {
-    const ms = g.stmts.map(plotModel).filter((m) => m && m.editable);
-    if (!ms.length) return null;
-    const xs = new Set(ms.map((m) => (m.x ? m.x.text : '')));
-    return xs.size === 1 ? [...xs][0] : null;
-  }
-
-  // nastaví proměnnou na ose X ve všech jednoduchých řádcích plot; vrací počet přeskočených
-  function setX(lines, fig, name) {
+  /**
+   * Proměnná na ose X u všech jednoduchých křivek grafu (pravý klik ve Workspace).
+   * ok(y) – smí křivka s tímto Y dostat tuto X (stejná délka)? Jinak jí zůstane původní X.
+   * Křivka, která má na Y právě tuto proměnnou, zmizí (nemůže být sama proti sobě).
+   * Vrací { skipped (ručně psané řádky), kept (Y, kterým zůstala původní X) }.
+   */
+  function setX(lines, fig, name, ok) {
     const { g } = ctxFor(lines, fig);
-    let changed = 0;
     let skipped = 0;
-    const dels = [];
+    const kept = [];
+    const edits = [];
     g.stmts.forEach((s) => {
-      if (!s.call || !G.PLOT_FNS.has(s.call.fn)) return;
+      if (!isPlot(s)) return;
       const m = plotModel(s);
       if (!m || !m.editable) { skipped++; return; }
-      if (name && m.y.text === name) { dels.push(s.line); return; }   // proměnná nemůže být sama proti sobě
-      m.x = name ? { kind: 'ident', text: name } : null;
-      replaceStmt(lines, s, serializePlot(m));
-      changed++;
+      const n0 = m.pairs.length;
+      m.pairs = m.pairs.filter((p) => !(name && p.y.text === name));
+      if (m.pairs.length < n0) tidy(m);
+      m.pairs.forEach((p) => { if (!name || !ok || ok(p.y.text)) p.x = name ? ident(name) : null; else kept.push(p.y.text); });
+      edits.push({ s, code: m.pairs.length ? serializePlot(m) : null });
     });
-    dels.reverse().forEach((l) => deleteLine(lines, l));
-    dropUnusedTime(lines, fig);
-    return { changed, skipped };
+    edits.reverse().forEach((e) => { if (e.code === null) deleteLine(lines, e.s.line); else replaceStmt(lines, e.s, e.code); });
+    try { dropUnusedTime(lines, fig); } catch (e) { /* graf zmizel */ }
+    cleanupRight(lines, fig);
+    return { skipped, kept };
   }
 
-  // řádek s časovou osou, kterou už nic ve skupině nepoužívá, zmizí
+  // řádek s časovým vektorem, který už nic ve skupině nepoužívá, zmizí
   function dropUnusedTime(lines, fig) {
     const { g } = ctxFor(lines, fig);
-    const times = g.stmts.map(timeModel).filter(Boolean);
-    const dead = times.filter((t) => !g.stmts.some((s) => s !== t.st && new RegExp('(^|[^A-Za-z0-9_])' + t.name + '([^A-Za-z0-9_]|$)').test(s.code)));
+    const times = timeDefs(g);
+    const dead = times.filter((t) => !g.stmts.some((s) => s !== t.st && refRe(t.name).test(s.code)));
     dead.reverse().forEach((t) => deleteLine(lines, t.st.line));
   }
 
   /**
-   * Osa X jako čas z periody vzorkování: vloží (nebo upraví) řádek
-   * t = (0:numel(y)-1)*dt před první plot a nastaví t na osu X.
-   * taken = názvy, které už ve workspace jsou (aby se nepřepsala jiná proměnná t)
+   * Přidá křivku y (na levou osu) s X podle xs (tvary jako u setCurveData – z menu převezme
+   * X předchozí křivky). Když poslední řádek plot vlevo nemá volby platné pro celý řádek,
+   * přidá se do něj další dvojice: plot(t, y, 'o', tHladka, yfit, '-'); jinak nový řádek
+   * (s hold on). o = { taken, legendOn, names }. Vrací pořadí (ord) nové křivky.
    */
-  function setTimeX(lines, fig, dt, taken) {
+  function addCurve(lines, fig, y, xs, o) {
+    o = o || {};
     const { g } = ctxFor(lines, fig);
-    const plots = g.stmts.filter((s) => s.call && G.PLOT_FNS.has(s.call.fn));
-    const models = plots.map(plotModel).filter((m) => m && m.editable);
-    if (!models.length) throw new Error('Nejdřív přidej křivku na osu Y – délka časového vektoru se odvodí z ní');
-    const tm = timeOf(g);
-    let name;
-    if (tm) {
-      name = tm.name;
-      replaceStmt(lines, tm.st, name + ' = (0:numel(' + tm.ref + ')-1)*' + dt);
+    const sm = sideMap(g);
+    const yy = hasYy(g);
+    const lefts = g.stmts.filter((s) => isPlot(s) && (!yy || sm.get(s) === 'left'));
+    const last = lefts[lefts.length - 1];
+    const lm = last ? plotModel(last) : null;
+    const leg = labelsLegend(g);
+    const pair = { x: null, y: ident(y), spec: {} };
+    const appendable = !!(lm && lm.editable && lm.opts.every(([n]) => lc(n) === 'displayname') && (!lm.opts.length || o.legendOn));
+    const countTo = (line) => fig.ax.lines.filter((ln) => ln.line <= line).length;
+    let at;
+    let j = 0;
+    let before;     // počet čar grafu před novou křivkou (kvůli popiskům legendy)
+    if (appendable) {
+      before = countTo(last.line);
+      lm.pairs.push(pair);
+      j = lm.pairs.length - 1;
+      replaceStmt(lines, last, serializePlot(lm));
+      at = last.line;
     } else {
-      const ref = models[0].y.text;
-      const used = new Set(taken || []);
-      const cands = ['t', 't_' + ref];
-      for (let k = 2; k < 50; k++) cands.push('t' + k);
-      name = cands.find((c) => !used.has(c) && c !== ref);
-      insertAfter(lines, plots[0].line - 1, name + ' = (0:numel(' + ref + ')-1)*' + dt + ';', indentOf(lines, g));
-    }
-    return setX(lines, fig, name);
-  }
-
-  // změna periody u existující časové osy
-  function setTimeDt(lines, fig, dt) {
-    const { g } = ctxFor(lines, fig);
-    const tm = timeOf(g);
-    if (!tm) throw new Error('Graf nemá časovou osu');
-    replaceStmt(lines, tm.st, tm.name + ' = (0:numel(' + tm.ref + ')-1)*' + dt);
-  }
-
-  // přidá křivky plot(x, název) – za poslední plot na levé ose, případně doplní hold on
-  function addY(lines, fig, names, xname, withNames) {
-    names.forEach((n) => {
-      const { g } = ctxFor(lines, fig);
-      const m = { fn: 'plot', x: xname ? { kind: 'ident', text: xname } : null, y: { kind: 'ident', text: n }, spec: {}, opts: [] };
-      if (withNames) setOpt(m, 'DisplayName', q(n));
+      const m = { fn: 'plot', pairs: [pair], opts: [] };
+      if (o.legendOn && !leg) setOpt(m, 'DisplayName', q(y));
       const ind = indentOf(lines, g);
-      const sm = sideMap(g);
-      const lefts = g.stmts.filter((s) => isPlot(s) && sm.get(s) === 'left');
-      let after = hasYy(g) ? (lefts.length ? lefts[lefts.length - 1].endLine : null) : lastPlotLine(g);
+      let after = last ? last.endLine : null;
       if (after !== null) {
+        before = countTo(after);
         if (!holdBefore(g, after + 1)) { insertAfter(lines, after, 'hold on', ind); after++; }
       } else {
         // za figure / hold on na začátku skupiny
@@ -563,28 +800,62 @@
         // v grafu s yyaxis ještě před první křivku vpravo (aby nová křivka byla vlevo)
         if (sm.get(g.stmts[k]) === 'right') {
           const yl = g.stmts.filter((s) => yyWord(s) === 'left');
-          if (yl.length) after = yl[yl.length - 1].endLine; else { insertAfter(lines, g.last, ['yyaxis left', serializePlot(m)], ind); return; }
+          if (yl.length) after = yl[yl.length - 1].endLine;
+          else after = null;
         }
-        if (g.stmts.some((s) => isPlot(s) && s.endLine <= after) && !holdBefore(g, after + 1)) { insertAfter(lines, after, 'hold on', ind); after++; }
+        if (after === null) {
+          before = fig.ax.lines.length;
+          insertAfter(lines, g.last, ['yyaxis left', serializePlot(m)], ind);
+          at = g.last + 2;
+        } else {
+          before = countTo(after);
+          if (g.stmts.some((s) => isPlot(s) && s.endLine <= after) && !holdBefore(g, after + 1)) { insertAfter(lines, after, 'hold on', ind); after++; }
+        }
       }
-      insertAfter(lines, after, serializePlot(m), ind);
-    });
+      if (at === undefined) { insertAfter(lines, after, serializePlot(m), ind); at = after + 1; }
+    }
+    // popisky v legend(…): nová křivka dostane svůj na správném místě
+    if (leg || (appendable && o.legendOn)) {
+      const labels = padLabels(leg ? leg.m.labels.slice() : (o.names || []).slice(), before, o.names);
+      labels.splice(before, 0, y);
+      writeLabels(lines, fig, labels);
+    }
+    const g2 = ctxFor(lines, fig).g;
+    const nc = curvesOf(g2).find((c) => c.st.line === at && c.j === j);
+    const ord = nc ? nc.ord : curvesOf(g2).length - 1;
+    if (nc && xs && xs.kind !== 'index') setCurveData(lines, fig, ord, xs, undefined, o.taken);
+    return ord;
   }
 
-  // odebere proměnné z grafu (řádky plot s nimi na ose Y; z osy X je jen sundá)
+  // odebere proměnné z grafu (křivky s nimi na ose Y i s popiskem; z osy X je jen sundá -> index)
   function removeVars(lines, fig, names) {
     const { g } = ctxFor(lines, fig);
     let skipped = 0;
     const edits = [];
+    const dropIdx = [];
     g.stmts.forEach((s) => {
-      if (!s.call || !G.PLOT_FNS.has(s.call.fn)) return;
+      if (!isPlot(s)) return;
       const m = plotModel(s);
       if (!m || !m.editable) { skipped++; return; }
-      if (names.includes(m.y.text)) edits.push({ line: s.line, del: true });
-      else if (m.x && names.includes(m.x.text)) { m.x = null; edits.push({ line: s.line, st: s, code: serializePlot(m) }); }
+      let changed = false;
+      const keep = [];
+      m.pairs.forEach((p, j) => {
+        if (names.includes(p.y.text)) { changed = true; const k = lineIndex(fig, s.line, j); if (k >= 0) dropIdx.push(k); return; }
+        if (p.x && names.includes(p.x.text)) { p.x = null; changed = true; }
+        keep.push(p);
+      });
+      if (!changed) return;
+      m.pairs = keep;
+      edits.push({ s, code: keep.length ? serializePlot(tidy(m)) : null });
     });
-    edits.sort((a, b) => b.line - a.line).forEach((e) => { if (e.del) deleteLine(lines, e.line); else replaceStmt(lines, e.st, e.code); });
+    const leg = labelsLegend(g);
+    if (leg && dropIdx.length) {
+      dropIdx.sort((a, b) => b - a).forEach((k) => { if (k < leg.m.labels.length) leg.m.labels.splice(k, 1); });
+      replaceStmt(lines, leg.s, serializeLegend(leg.m));
+    }
+    edits.reverse().forEach((e) => { if (e.code === null) deleteLine(lines, e.s.line); else replaceStmt(lines, e.s, e.code); });
     cleanupRight(lines, fig);
+    try { dropUnusedTime(lines, fig); } catch (e) { /* graf zmizel */ }
     return { skipped };
   }
 
@@ -599,7 +870,8 @@
     return an;
   }
 
-  // nový graf na konci bloku; vrací číslo řádku s příkazem figure
+  // nový graf na konci bloku; vrací číslo řádku s příkazem figure.
+  // names = názvy Y (všechny proti xname) nebo [{ y, x }]; víc křivek = jeden plot s dvojicemi
   function newFigure(lines, names, xname, extra) {
     const an = ensureBlock(lines);
     const b = an.block;
@@ -609,10 +881,8 @@
     if (an.stmts.length) add.push('');
     const figLine = at + add.length + 1;
     add.push('figure');
-    (names || []).forEach((n, k) => {
-      add.push(serializePlot({ fn: 'plot', x: xname ? { text: xname } : null, y: { text: n }, spec: {}, opts: [] }));
-      if (k === 0 && names.length > 1) add.push('hold on');
-    });
+    const items = (names || []).map((n) => (typeof n === 'string' ? { y: n, x: xname || null } : n));
+    if (items.length) add.push(serializePlot({ fn: 'plot', pairs: items.map((it) => ({ x: it.x ? ident(it.x) : null, y: ident(it.y), spec: {} })), opts: [] }));
     (extra || []).forEach((t) => add.push(t));
     lines.splice(at, 0, ...add);
     return figLine;
@@ -660,11 +930,13 @@
     const series = (f.series || []).filter((s) => s && s.var);
     const legendOn = f.legend === 'show' || ((f.legend || 'auto') === 'auto' && series.length >= 2);
     series.forEach((s, i) => {
-      const m = { fn: 'plot', x: f.x ? { text: f.x } : null, y: { text: s.var }, spec: {}, opts: [] };
+      // osa X starého grafu (společná) se zkopíruje do každé křivky
+      const sp = {};
+      const m = { fn: 'plot', pairs: [{ x: f.x ? ident(f.x) : null, y: ident(s.var), spec: sp }], opts: [] };
       const mode = s.mode || 'lines';
       const ls = OLD_DASH[s.dash] || '-';
-      if (mode !== 'lines') m.spec.marker = 'o';
-      if (mode === 'markers') { /* jen body */ } else if (ls !== '-' || mode !== 'lines') m.spec.ls = ls;
+      if (mode !== 'lines') sp.marker = 'o';
+      if (mode === 'markers') { /* jen body */ } else if (ls !== '-' || mode !== 'lines') sp.ls = ls;
       if (s.color && lc(s.color) !== lc(G.PALETTE[i % G.PALETTE.length])) setOpt(m, 'Color', q(String(s.color).toUpperCase()));
       if (s.label || legendOn) setOpt(m, 'DisplayName', q(htmlToTex(s.label || s.var)));
       out.push(serializePlot(m));
@@ -713,11 +985,12 @@
 
   MC.plotcode = {
     HEADER, HEADER_RE, SECTION_RE,
-    analyze, groupOf, byFn, plotModel, legendModel, setModel, represented, commonX, isTight,
+    analyze, groupOf, byFn, plotModel, serializePlot, legendModel, setModel, represented, commonX, isTight,
     sideMap, sideOf, hasRight, yyWord,
+    curvesOf, xOf, lastX, setCurveData, addCurve, deleteCurve, isolate,
     setText, setLim, setScale, setFlag, setTight, setLegend, setSeries, setSide, deleteStmt, cleanupRight,
-    setX, addY, removeVars, newFigure, removeFigure, ensureBlock,
-    timeModel, timeOf, setTimeX, setTimeDt,
+    setX, removeVars, newFigure, removeFigure, ensureBlock,
+    timeModel, timeOf, timeDefs,
     migrate, fromOldFigure, htmlToTex, q,
   };
 })();

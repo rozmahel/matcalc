@@ -772,10 +772,7 @@
     if (res && res.skipped) toast(plural(res.skipped, 'ručně psaný řádek zůstal', 'ručně psané řádky zůstaly', 'ručně psaných řádků zůstalo') + ' beze změny – uprav je v editoru');
     const code = lines.join('\n');
     if (code !== M.code) {
-      // rozepsané hodnoty u křivek patří k číslům řádků – po přidání / smazání řádku neplatí
-      if (code.split('\n').length !== M.code.split('\n').length) {
-        Object.keys(M.raw).filter((k) => /^s\d+:/.test(k)).forEach((k) => { delete M.raw[k]; delete M.fieldBad[k]; });
-      }
+      // rozepsané hodnoty u křivek patří k pořadí křivky (c3:…) – přidání a mazání je posouvá samo (remapCurveKeys)
       M.code = code;
       M.run = code === M.base.code ? baseRun() : runDraftCode(code);
     }
@@ -873,7 +870,7 @@
     flushField();
     if (hasFieldErr() || hasStateErr()) {
       toast(M.state['@run'] ? 'Návrh hlásí chybu (' + M.state['@run'] + ') – do kódu ho nezapíšu' : 'Nejdřív oprav červeně označená pole – neplatné hodnoty se do kódu nezapíšou', true);
-      const bad = $('#figSettings input.bad');
+      const bad = $('#figSettings .bad');
       if (bad) bad.focus();
       return false;
     }
@@ -1469,12 +1466,14 @@
     const g = f.runId === S.runId ? PC.groupOf(an, f) : null;
     const key = cur().id + ':' + f.num;
     const hasPlots = g ? g.stmts.some((st) => st.call && G.PLOT_FNS.has(st.call.fn)) : f.ax.lines.length > 0;
-    const editPlots = g ? g.stmts.filter((st) => { const m = PC.plotModel(st); return m && m.editable; }).length : 0;
+    const curves = g ? PC.curvesOf(g) : [];
     const pendingX = !hasPlots && S.pendingX[key] ? S.pendingX[key] : null;
     const xName = g ? (PC.commonX(g) !== null ? PC.commonX(g) : pendingX || '') : null;
+    // X nové křivky: jako u předchozí křivky; v prázdném grafu osa X zvolená ve Workspace (pendingX)
+    const nextX = (g && PC.lastX(g)) || (pendingX ? { kind: 'var', name: pendingX } : { kind: 'index' });
     // řádky mimo skupinu, které graf taky mění
     const outside = g ? f.stmts.filter((st) => st.line < g.start || st.line > g.end) : f.stmts;
-    return { fig: f, an, g, editable: !!g, xName, pendingX, key, outside, hasPlots, editPlots };
+    return { fig: f, an, g, editable: !!g, xName, nextX, curves, pendingX, key, outside, hasPlots };
   }
   const menuCtx = () => figCtx(M.run || view());
 
@@ -1490,10 +1489,10 @@
     const xName = c.editable ? c.xName : null;
     if (!plottable.length) items.push({ note: descs[0].d.reason || 'Vybrané proměnné nejde vykreslit.' });
     else if (!canEdit) items.push({ note: 'Aktivní graf vzniká v kódu na ř. ' + c.fig.createLine + ' (mimo blok %% Grafy). Klikáním ho neměním – použij „Vykreslit v novém grafu“.' });
-    else if (xName && xName !== single && has(S.scope, xName)) {
-      const xd = E.describe(S.scope[xName]);
-      const bad = plottable.filter((n) => n !== xName && E.describe(S.scope[n]).length !== xd.length);
-      if (bad.length) items.push({ note: 'Pozor: ' + bad.join(', ') + ' má jinou délku než osa X „' + xName + '“ (' + xd.length + ').' });
+    else if (c.editable && c.nextX.kind === 'var' && lenOf(c.nextX.name) !== null) {
+      const xn = c.nextX.name;
+      const bad = plottable.filter((n) => n !== xn && lenOf(n) !== null && lenOf(n) !== lenOf(xn));
+      if (bad.length) items.push({ note: 'Pozor: ' + bad.join(', ') + ' má jinou délku než X předchozí křivky „' + xn + '“ (' + lenOf(xn) + ') – na osu Y se přidá proti indexu vzorku, X pak zvol v Nastavení.' });
     }
     const inFig = c.fig ? names.filter((n) => c.fig.ax.lines.some((ln) => ln.xname === n || ln.yname === n) || c.pendingX === n) : [];
     items.push({
@@ -1557,21 +1556,28 @@
   const applyFor = (panel) => (panel ? (fn) => editDraft(fn) : (fn) => writeCode(fn));
   const ctxFor = (panel) => (panel ? menuCtx() : figCtx());
 
-  // kontrola stejné délky X a Y; vrací text chyby nebo ''
-  function lenProblem(xName, ys) {
-    if (!xName || !has(S.scope, xName)) return '';
-    const xd = descOf(xName);
-    if (!xd.plottable) return '';
-    const bad = ys.filter((y) => y.name !== xName && y.len !== xd.length);
-    if (!bad.length) return '';
-    const n = (k) => k.toLocaleString('cs-CZ');
-    return 'Vektory X a Y musí mít stejnou délku: osa X „' + xName + '“ má ' + n(xd.length) + ' hodnot, ale ' +
-      bad.map((b) => '„' + b.name + '“ má ' + n(b.len)).join(', ') + '.';
+  // délka vektoru ve workspace, null = neznámá (proměnná chybí nebo nejde vykreslit)
+  function lenOf(name) {
+    if (!name || !has(S.scope, name)) return null;
+    const d = descOf(name);
+    return d.plottable ? d.length : null;
   }
-  const yLens = (names) => names.filter((n) => has(S.scope, n)).map((n) => ({ name: n, len: descOf(n).length }));
+  const nfmt = (k) => k.toLocaleString('cs-CZ');
+  // délka se kontroluje jen v rámci dvojice X–Y jedné křivky; vrací text chyby nebo ''
+  function pairProblem(x, y) {
+    if (!x || x === '@time') return '';
+    if (x === y) return '„' + y + '“ nemůže být na ose X i Y stejné křivky – vyber jinou X.';
+    const lx = lenOf(x);
+    const ly = lenOf(y);
+    if (lx === null || ly === null || lx === ly) return '';
+    return 'X „' + x + '“ má ' + nfmt(lx) + ' hodnot, Y „' + y + '“ má ' + nfmt(ly) + ' – X a Y jedné křivky musí mít stejnou délku.';
+  }
+  // jména čar grafu (pro popisky legend(…))
+  const lineNames = (fig) => fig.ax.lines.map((ln) => ln.displayName || ln.yname || ln.ytext);
 
-  function setX(name, panel) {
-    const c = ctxFor(panel);
+  // „Nastavit jako osu X“ z Workspace: X všech křivek, které mají stejnou délku (ostatním zůstane jejich X)
+  function setX(name) {
+    const c = figCtx();
     if (!c.fig) {
       // ještě žádný graf: prázdný figure + zapamatovaná osa X
       writeCode((lines) => ({ selectLine: PC.newFigure(lines, [], null) }));
@@ -1586,36 +1592,82 @@
       toast('Osa X: ' + (name || 'index') + ' – teď přidej proměnnou na osu Y');
       return;
     }
-    const prob = lenProblem(name, c.fig.ax.lines.map((ln) => ({ name: ln.yname || ln.ytext, len: ln.y.length })));
-    if (prob) { toast(prob, true); if (panel) renderMenu(); return; }
-    applyFor(panel)((lines, fig) => PC.setX(lines, fig, name));
+    const res = writeCode((lines, fig) => PC.setX(lines, fig, name, (y) => !pairProblem(name, y)));
+    if (res && res.kept && res.kept.length) {
+      toast('„' + name + '“ má jinou délku než ' + res.kept.map((n) => '„' + n + '“').join(', ') + ' – ' + (res.kept.length > 1 ? 'těmto křivkám' : 'této křivce') + ' zůstala původní X', true);
+    }
   }
 
-  // osa X = čas z periody vzorkování (t = (0:n-1)*dt zapsané do bloku %% Grafy) – z menu nastavení
-  async function chooseTime() {
-    const c = menuCtx();
-    if (!c.fig || !c.editable) return;
-    if (!c.editPlots) { toast('Nejdřív přidej křivku na osu Y – délka časového vektoru se odvodí z ní', true); renderMenu(); return; }
-    const v = await promptText('Čas z periody vzorkování', 'Perioda vzorkování v sekundách (např. 0,01). Na osu X se dá vektor t = (0 : n−1) · perioda.', S.data.ui.lastDt || '0.01');
+  // perioda vzorkování pro „čas z periody“ (text s tečkou, nebo null = zrušeno)
+  async function askDt() {
+    const v = await promptText('Čas z periody vzorkování', 'Perioda vzorkování v sekundách (např. 0,01). Na osu X této křivky se dá její vlastní vektor t = (0 : n−1) · perioda, n = délka její Y.', S.data.ui.lastDt || '0.01');
     focusMenu();
-    if (v === null || v === undefined) { renderMenu(); return; }
+    if (v === null || v === undefined) return null;
     const dt = Number(String(v).trim().replace(',', '.'));
-    if (!(dt > 0) || !Number.isFinite(dt)) { toast('Perioda musí být kladné číslo, např. 0.01', true); renderMenu(); return; }
+    if (!(dt > 0) || !Number.isFinite(dt)) { toast('Perioda musí být kladné číslo, např. 0.01', true); return null; }
     S.data.ui.lastDt = String(v).trim();
     save();
-    const taken = new Set(Object.keys(S.scope));
-    editDraft((lines, fig) => PC.setTimeX(lines, fig, String(+dt.toPrecision(12)), taken));
+    return String(+dt.toPrecision(12));
   }
 
+  // X pro novou křivku y převzatá z předchozí křivky; jiná délka -> zatím index (bad = převzatá X)
+  function inheritX(xs, y) {
+    if (!xs || xs.kind !== 'var') return { xs: xs || { kind: 'index' } };
+    if (pairProblem(xs.name, y)) return { xs: { kind: 'index' }, bad: xs.name };
+    return { xs };
+  }
+
+  /**
+   * Přidá křivky na osu Y. Každá převezme X z předchozí křivky (proměnnou, index, nebo čas
+   * z periody se stejnou periodou – vlastní vektor podle své délky). Když převzatá proměnná
+   * nemá stejnou délku, křivka je zatím proti indexu: v menu se X ukáže červeně u té křivky.
+   */
   function addY(names, panel) {
     const c = ctxFor(panel);
     if (!c.fig) { newFigWith(names); return; }
-    const legend = c.fig.ax.legend && c.fig.ax.legend.visible;
-    const xName = c.xName || null;
-    const prob = lenProblem(xName, yLens(names));
-    if (prob) { toast(prob, true); if (panel) renderMenu(); return; }
-    applyFor(panel)((lines, fig) => { PC.addY(lines, fig, names, xName && !names.includes(xName) ? xName : null, legend); });
+    const taken = Object.keys(S.scope);
+    const legendOn = !!(c.fig.ax.legend && c.fig.ax.legend.visible);
+    const pend = [];
+    const added = [];
+    applyFor(panel)((lines, fig0) => {
+      let fig = fig0;
+      let xs = c.nextX;
+      names.forEach((n, i) => {
+        if (i > 0) {
+          // další křivka: graf znovu z rozpracovaného kódu (pořadí čar kvůli legendě)
+          const r = runDraftCode(lines.join('\n'));
+          fig = r.gfx.figs.find((f) => f.num === fig0.num) || fig;
+        }
+        const ih = inheritX(xs, n);
+        const ord = PC.addCurve(lines, fig, n, ih.xs, { taken, legendOn: legendOn || !!(fig.ax.legend && fig.ax.legend.visible), names: lineNames(fig) });
+        added.push(ord);
+        if (ih.bad) pend.push({ ord, x: ih.bad, y: n });
+      });
+    });
     if (c.pendingX) delete S.pendingX[c.key];
+    // nová křivka mohla vzniknout uprostřed (vlevo před křivkami vpravo) – rozepsané hodnoty za ní se posunou
+    if (panel && M.open) added.forEach((o) => remapCurveKeys((k) => (k >= o ? k + 1 : k)));
+    if (!pend.length) return;
+    if (panel && M.open) {
+      pend.forEach((p) => { M.raw[fieldKey('x', p.ord)] = p.x; M.fieldBad[fieldKey('xy', p.ord)] = pairProblem(p.x, p.y); });
+      renderMenu();
+      renderBar();
+    } else {
+      toast(pend.map((p) => '„' + p.y + '“').join(', ') + ': X předchozí křivky „' + pend[0].x + '“ má jinou délku – křivka je zatím proti indexu vzorku. X změň v Nastavení grafu.', true);
+    }
+  }
+
+  // klíče rozepsaných polí křivek (c<pořadí>:…) po přidání / smazání křivky; fn(ord) -> nové pořadí, null = pryč
+  function remapCurveKeys(fn) {
+    [M.raw, M.fieldBad].forEach((obj) => {
+      const ent = Object.keys(obj).filter((k) => /^c\d+:/.test(k)).map((k) => [k, obj[k]]);
+      ent.forEach(([k]) => delete obj[k]);
+      ent.forEach(([k, v]) => {
+        const m = k.match(/^c(\d+):([\s\S]*)$/);
+        const n = fn(+m[1]);
+        if (n !== null && n !== undefined) obj['c' + n + ':' + m[2]] = v;
+      });
+    });
   }
 
   function removeFromFig(names) {
@@ -1628,9 +1680,11 @@
   function newFigWith(names) {
     const c = figCtx();
     let xName = c.editable && c.xName && has(S.scope, c.xName) && !names.includes(c.xName) ? c.xName : null;
-    // časová osa patří ke svému grafu; jiná délka -> nový graf proti indexu
-    if (xName && (lenProblem(xName, yLens(names)) || (c.g && PC.timeOf(c.g) && PC.timeOf(c.g).name === xName))) xName = null;
-    writeCode((lines) => ({ selectLine: PC.newFigure(lines, names, xName) }));
+    // časový vektor patří ke svému grafu
+    if (xName && c.g && PC.timeDefs(c.g).some((t) => t.name === xName)) xName = null;
+    // X jen u křivek se stejnou délkou, ostatní proti indexu
+    const items = names.map((n) => ({ y: n, x: xName && !pairProblem(xName, n) ? xName : null }));
+    writeCode((lines) => ({ selectLine: PC.newFigure(lines, items, null) }));
   }
 
   function addFigure() {
@@ -1718,9 +1772,21 @@
   /* ---------- panel nastavení ---------- */
   const LOC_OPTS = [['northeast', 'Vpravo nahoře'], ['northwest', 'Vlevo nahoře'], ['southeast', 'Vpravo dole'], ['southwest', 'Vlevo dole'],
     ['north', 'Nahoře uprostřed'], ['south', 'Dole uprostřed'], ['best', 'Nejlepší (best)'], ['northeastoutside', 'Mimo graf vpravo'], ['southoutside', 'Pod grafem']];
+  const SIDE_OPTS = [['left', 'levá'], ['right', 'pravá (vedlejší)']];
   const LS_OPTS = [['-', '—— plná'], ['--', '– – čárkovaná'], [':', '······ tečkovaná'], ['-.', '–·–· čerchovaná'], ['none', 'bez čáry']];
   const MK_OPTS = [['none', 'bez bodů'], ['o', '○ kroužek'], ['s', '□ čtverec'], ['d', '◇ kosočtverec'], ['^', '△ trojúhelník'], ['v', '▽ trojúhelník'], ['x', '× křížek'], ['+', '+ plus'], ['*', '✱ hvězdička'], ['.', '• tečka']];
-  const SIDE_OPTS = [['left', 'levá'], ['right', 'pravá (vedlejší)']];
+
+  // popisek osy a jednotky v hranatých závorkách na konci: 'Čas [s]' <-> { name: 'Čas', unit: 's' }
+  function splitUnit(text) {
+    const s = String(text || '');
+    const m = s.match(/^(?:([\s\S]*?\S)\s+)?\[([^[\]]*)\]\s*$/);
+    return m ? { name: m[1] || '', unit: m[2] } : { name: s, unit: '' };
+  }
+  function joinUnit(name, unit) {
+    const n = String(name || '').trim();
+    const u = String(unit || '').trim();
+    return u ? (n ? n + ' [' + u + ']' : '[' + u + ']') : n;
+  }
 
   function lineLink(line) { return '<button class="ln" data-goto="' + line + '" title="Přejít na řádek ' + line + '">ř. ' + line + '</button>'; }
   function roCode(st) { return '<div class="fs-ro"><code>' + esc(st.code) + '</code>' + lineLink(st.line) + '</div>'; }
@@ -1734,8 +1800,8 @@
     return { st, ro: !PC.represented(st) };
   }
 
-  // klíč pole v menu (u křivek s číslem řádku) – podle něj se pamatuje neplatná hodnota
-  const fieldKey = (k, s) => (s ? 's' + s + ':' : '') + k;
+  // klíč pole v menu (u křivek s pořadím křivky c<ord>:) – podle něj se pamatuje neplatná hodnota
+  const fieldKey = (k, ord) => (ord === null || ord === undefined ? '' : 'c' + ord + ':') + k;
 
   // ovládací prvky; u textových polí neplatná rozepsaná hodnota (M.raw) zůstává červeně
   function controls(sKey) {
@@ -1774,6 +1840,17 @@
       }
       return '<label class="fs-field"><span>' + label + '</span>' + input(key, t ? t.text : '', 'bez popisku') + '</label>';
     };
+    // popisek osy s jednotkami: xlabel('Čas [s]') = Popisek „Čas“ + Jednotky „s“
+    const labelField = (fn, key, P, side, unitPh) => {
+      const lo = ed ? lastOf(g, fn, side) : null;
+      const t = P ? P[fn] : null;
+      if (!ed || (lo && lo.ro)) {
+        return '<div class="fs-field"><span>Popisek</span>' + (lo ? roCode(lo.st) : '<div class="fs-val">' + esc(t && t.text ? t.text : '–') + '</div>') + '</div>';
+      }
+      const sp = splitUnit(t ? t.text : '');
+      return '<label class="fs-field"><span>Popisek</span>' + input(key, sp.name, 'bez popisku') + '</label>' +
+        '<label class="fs-field"><span>Jednotky</span>' + input(key + 'Unit', sp.unit, unitPh) + '</label>';
+    };
     const rangeField = (fn, key, P, side) => {
       const lo = ed ? lastOf(g, fn, side) : null;
       const l = P ? P[fn] : null;
@@ -1791,69 +1868,73 @@
 
     h += '<div class="fs-sec"><h4>Graf <span class="fs-fig">Figure ' + f.num + '</span></h4>' + textField('title', 'Titulek', 'title', ax) + '</div>';
 
-    // osa X
-    const xVars = vars.slice();
-    const xv = c.xName;
-    const tm = ed ? PC.timeOf(g) : null;
-    const isTime = !!(tm && xv === tm.name);
-    if (xv && !xVars.includes(xv) && !isTime) xVars.push(xv);
-    let xSel;
-    if (ed && (c.editPlots || !c.hasPlots)) {
-      const mixed = c.hasPlots && PC.commonX(g) === null;
-      const xOpts = (mixed ? [['*', '(různé – viz kód)', true]] : [])
-        .concat([['', '(index vzorku 1…n)'], ['@time', isTime ? 'čas z periody' : 'čas z periody…']])
-        .concat(xVars.filter((v) => !(tm && v === tm.name)).map((v) => [v, varLabel(v) + (vars.includes(v) ? '' : ' (chybí)')]));
-      xSel = '<label class="fs-field"><span>Proměnná</span>' + sel('x', xOpts, mixed ? '*' : isTime ? '@time' : xv || '') + '</label>';
-      if (isTime) {
-        xSel += '<div class="fs-field"><span>Perioda</span><span class="fs-dt">' + input('dt', tm.dt, '0.01') + '<span>s</span>' + lineLink(tm.st.line) + '</span></div>' +
-          '<p class="fs-tip" style="margin:0 0 6px"><code>' + esc(tm.name) + '</code> = (0 : n−1) · perioda, n = délka <code>' + esc(tm.ref) + '</code></p>';
-      }
-    } else {
-      const xs = [...new Set(ax.lines.map((ln) => ln.xtext || 'index'))];
-      xSel = '<div class="fs-field"><span>Data</span><div class="fs-val mono">' + esc(xs.join(', ') || '–') + '</div></div>';
-    }
-    h += '<div class="fs-sec"><h4>Osa X</h4>' + xSel + textField('xlabel', 'Popisek', 'xlabel', ax) + rangeField('xlim', 'xlim', ax) +
-      '<div class="fs-row" style="margin-top:6px">' + chk('xlog', 'Logaritmická', ax.xscale === 'log', !ed) + '</div></div>';
-    h += '<div class="fs-sec"><h4>' + (rightUsed ? 'Osa Y vlevo' : 'Osa Y') + '</h4>' + textField('ylabel', 'Popisek', 'ylabel', ax, 'left') + rangeField('ylim', 'ylim', ax, 'left') +
-      '<div class="fs-row" style="margin-top:6px">' + chk('ylog', 'Logaritmická', ax.yscale === 'log', !ed) + '</div></div>';
+    // osy: jen vzhled (popisek s jednotkami, rozsah, logaritmická); data X má každá křivka svoje
+    const unitPh = (lines, key) => { const us = [...new Set(lines.map((ln) => ln[key]).filter(Boolean))]; return us.length === 1 ? 'např. ' + us[0] : 'bez jednotek'; };
+    const leftL = ax.lines.filter((ln) => ln.side !== 'right');
+    const rightL = ax.lines.filter((ln) => ln.side === 'right');
+    const logRow = (k, on) => '<div class="fs-row" style="margin-top:6px">' + chk(k, 'Logaritmická', on, !ed) + '</div>';
+    h += '<div class="fs-sec"><h4>Osa X</h4>' + labelField('xlabel', 'xlabel', ax, null, unitPh(ax.lines, 'xunit')) + rangeField('xlim', 'xlim', ax) + logRow('xlog', ax.xscale === 'log') + '</div>';
+    h += '<div class="fs-sec"><h4>' + (rightUsed ? 'Osa Y vlevo' : 'Osa Y') + '</h4>' + labelField('ylabel', 'ylabel', ax, 'left', unitPh(leftL, 'yunit')) + rangeField('ylim', 'ylim', ax, 'left') + logRow('ylog', ax.yscale === 'log') + '</div>';
     if (rightUsed && R) {
-      const one = ax.lines.filter((ln) => ln.side === 'right');
-      const sw = one.length === 1 ? '<span class="fs-swatch" style="--c:' + esc(one[0].color) + '" title="Popisky a čísla pravé osy mají barvu její křivky"></span>' : '';
-      h += '<div class="fs-sec fs-right"><h4>Osa Y vpravo (vedlejší) ' + sw + '</h4>' + textField('ylabel', 'Popisek', 'y2label', R, 'right') + rangeField('ylim', 'y2lim', R, 'right') +
-        '<div class="fs-row" style="margin-top:6px">' + chk('y2log', 'Logaritmická', R.yscale === 'log', !ed) + '</div></div>';
+      const sw = rightL.length === 1 ? '<span class="fs-swatch" style="--c:' + esc(rightL[0].color) + '" title="Popisky a čísla pravé osy mají barvu její křivky"></span>' : '';
+      h += '<div class="fs-sec fs-right"><h4>Osa Y vpravo (vedlejší) ' + sw + '</h4>' + labelField('ylabel', 'y2label', R, 'right', unitPh(rightL, 'yunit')) + rangeField('ylim', 'y2lim', R, 'right') + logRow('y2log', R.yscale === 'log') + '</div>';
     }
 
-    // křivky – jedna karta na řádek plot
+    // křivky – jedna karta na dvojici X–Y (i když je víc dvojic v jednom řádku plot)
     h += '<div class="fs-sec"><h4>Křivky</h4>';
     if (ed) {
-      const plotStmts = g.stmts.filter((st) => st.call && G.PLOT_FNS.has(st.call.fn));
-      plotStmts.forEach((st) => {
-        const m = PC.plotModel(st);
+      const curves = c.curves;
+      const tnames = new Set(PC.timeDefs(g).map((t) => t.name));
+      const runErr = M.state['@run'] && M.run && M.run.error ? M.run.error : null;
+      const errDiv = (t) => (t ? '<div class="fs-err">' + esc(t) + '</div>' : '');
+      const crow = (label, inner) => '<div class="fs-crow"><span>' + label + '</span>' + inner + '</div>';
+      const xVars = vars.filter((v) => !tnames.has(v));
+      curves.forEach((cv) => {
+        const st = cv.st;
         const rl = ax.lines.filter((ln) => ln.line === st.line);
-        const ln = rl[0];
-        const color = ln ? ln.color : '#888888';
-        if (!m || !m.editable || rl.length !== 1) {
-          h += '<div class="fs-series ro" style="--c:' + esc(color) + '"><div class="full">' + roCode(st) + '</div></div>';
+        const stErr = runErr && runErr.line === st.line ? 'Chyba na ř. ' + runErr.line + ': ' + runErr.message : '';
+        if (cv.ro || rl.length !== cv.m.pairs.length) {
+          if (cv.j === 0) h += '<div class="fs-series ro" style="--c:' + esc(rl[0] ? rl[0].color : '#888888') + '"><div class="full">' + roCode(st) + '</div>' + errDiv(stErr) + '</div>';
           return;
         }
+        const ln = rl[cv.j];
         const k = ax.lines.indexOf(ln);
-        const sv = vars.slice();
-        if (!sv.includes(m.y.text)) sv.push(m.y.text);
-        const sc = controls(st.line);
-        h += '<div class="fs-series" data-s="' + st.line + '" data-li="' + k + '" style="--c:' + esc(color) + '">' +
-          '<input type="color" data-k="color" value="' + esc(color.length === 7 ? color.toLowerCase() : '#888888') + '" title="Barva křivky">' +
-          sc.sel('y', sv.map((v) => [v, varLabel(v) + (vars.includes(v) ? '' : ' (chybí)')]), m.y.text) +
-          '<button class="fs-del" data-act="del-series" title="Smazat řádek ' + st.line + '">×</button>' +
-          '<div class="full">' + sc.input('label', ln.displayName, P.lineName(ln, k) + ' (text v legendě)') + '</div>' +
-          '<div class="pair">' + sc.sel('ls', LS_OPTS, ln.ls) + sc.sel('marker', MK_OPTS, ln.marker) + '</div>' +
-          '<div class="fs-width"><span>Osa Y</span>' + sc.sel('side', SIDE_OPTS, sm.get(st) || 'left') + '</div>' +
-          '<div class="fs-width"><span>Tloušťka</span>' + sc.input('width', ln.width, '0.5', 'number', ' min="0.1" step="0.5"') + lineLink(st.line) + '</div>' +
+        const ord = cv.ord;
+        const sc = controls(ord);
+        const xs = PC.xOf(g, cv.p);
+        const xCode = xs.kind === 'index' ? '' : xs.kind === 'time' ? '@time' : xs.name;
+        const xVal = has(M.raw, fieldKey('x', ord)) ? M.raw[fieldKey('x', ord)] : xCode;
+        const yVal = has(M.raw, fieldKey('y', ord)) ? M.raw[fieldKey('y', ord)] : cv.p.y.text;
+        const pairErr = M.fieldBad[fieldKey('xy', ord)] || '';
+        const bad = pairErr ? ' class="bad" title="' + esc(pairErr) + '"' : '';
+        const xv = xVars.slice();
+        if (xVal && xVal !== '@time' && !xv.includes(xVal)) xv.push(xVal);
+        const xOpts = [['', 'index vzorku 1…n'], ['@time', xs.kind === 'time' ? 'čas z periody' : 'čas z periody…']]
+          .concat(xv.map((v) => [v, varLabel(v) + (vars.includes(v) ? '' : ' (chybí)')]));
+        const yv = vars.slice();
+        if (!yv.includes(yVal)) yv.push(yVal);
+        h += '<div class="fs-series" data-c="' + ord + '" data-li="' + k + '" style="--c:' + esc(ln.color) + '">' +
+          '<input type="color" data-k="color" value="' + esc(ln.color.length === 7 ? ln.color.toLowerCase() : '#888888') + '" title="Barva křivky">' +
+          sc.input('label', ln.displayName, P.lineName(ln, k) + ' (název v legendě)') +
+          '<button class="fs-del" data-act="del-series" title="Odebrat křivku">×</button>' +
+          crow('X', sc.sel('x', xOpts, xVal, bad)) +
+          (xs.kind === 'time' && xVal === '@time'
+            ? crow('Perioda', '<span class="fs-dt">' + sc.input('dt', xs.dt, '0.01') + '<span>s</span>' + lineLink(xs.st.line) + '</span>') : '') +
+          crow('Y', sc.sel('y', yv.map((v) => [v, varLabel(v) + (vars.includes(v) ? '' : ' (chybí)')]), yVal, bad)) +
+          crow('Čára', sc.sel('ls', LS_OPTS, ln.ls)) +
+          crow('Body', sc.sel('marker', MK_OPTS, ln.marker)) +
+          crow('Osa Y', sc.sel('side', SIDE_OPTS, sm.get(st) || 'left')) +
+          crow('Tloušťka', sc.input('width', ln.width, '0.5', 'number', ' min="0.1" step="0.5"') + lineLink(st.line)) +
+          errDiv(pairErr || stErr) +
           '</div>';
       });
-      const used = new Set(ax.lines.map((l) => l.yname));
-      const addable = vars.filter((v) => v !== c.xName && !used.has(v));
-      if (addable.length) h += '<select data-act="add-series"><option value="">+ Přidat křivku…</option>' + addable.map((v) => opt(v, '', varLabel(v))).join('') + '</select>';
-      else if (!plotStmts.length) h += '<p class="fs-tip" style="margin-top:0">Zatím žádné vektory k vykreslení. Spusť skript.</p>';
+      const used = new Set(curves.filter((cv) => !cv.ro).map((cv) => cv.p.y.text));
+      const addable = vars.filter((v) => !used.has(v));
+      const nx = c.nextX;
+      const nxt = nx.kind === 'index' ? 'index vzorku' : nx.kind === 'time' ? 'čas z periody ' + nx.dt + ' s' : nx.name;
+      if (addable.length) h += '<select data-act="add-series" title="Nová křivka převezme X předchozí křivky (' + esc(nxt) + ')"><option value="">+ Přidat křivku…</option>' + addable.map((v) => opt(v, '', varLabel(v))).join('') + '</select>';
+      else if (!curves.length) h += '<p class="fs-tip" style="margin-top:0">Zatím žádné vektory k vykreslení. Spusť skript.</p>';
+      if (curves.length) h += '<p class="fs-tip" style="margin-top:6px">Nová křivka převezme X předchozí (teď <b>' + esc(nxt) + '</b>). Délka se kontroluje jen mezi X a Y jedné křivky.</p>';
     } else {
       ax.lines.forEach((ln, k) => {
         h += '<div class="fs-series ro" style="--c:' + esc(ln.color) + '"><div class="full"><div class="fs-ro"><code>' + esc(P.lineName(ln, k) + ': ' + (ln.xtext ? ln.xtext + ', ' : '') + ln.ytext) + (ln.side === 'right' ? '  (pravá osa)' : '') + '</code>' + lineLink(ln.line) + '</div></div></div>';
@@ -1906,7 +1987,7 @@
   function sameShape(a, b) {
     if (a.nodeType !== b.nodeType) return false;
     if (a.nodeType !== 1) return true;
-    if (a.tagName !== b.tagName || a.getAttribute('data-k') !== b.getAttribute('data-k') || a.getAttribute('data-s') !== b.getAttribute('data-s') ||
+    if (a.tagName !== b.tagName || a.getAttribute('data-k') !== b.getAttribute('data-k') || a.getAttribute('data-c') !== b.getAttribute('data-c') ||
       a.getAttribute('type') !== b.getAttribute('type') || a.childNodes.length !== b.childNodes.length) return false;
     for (let i = 0; i < a.childNodes.length; i++) if (!sameShape(a.childNodes[i], b.childNodes[i])) return false;
     return true;
@@ -1946,14 +2027,14 @@
     const active = document.activeElement;
     let focus = null;
     if (active && box.contains(active) && active.dataset.k) {
-      const sEl = active.closest('[data-s]');
-      focus = { k: active.dataset.k, s: sEl ? sEl.dataset.s : null, a: active.selectionStart, b: active.selectionEnd, v: isTextInput(active) ? active.value : null };
+      const sEl = active.closest('[data-c]');
+      focus = { k: active.dataset.k, s: sEl ? sEl.dataset.c : null, a: active.selectionStart, b: active.selectionEnd, v: isTextInput(active) ? active.value : null };
     }
     const scroll = scroller.scrollTop;
     box.innerHTML = html;
     scroller.scrollTop = scroll;
     if (focus) {
-      const q = (focus.s ? '[data-s="' + focus.s + '"] ' : '') + '[data-k="' + focus.k + '"]';
+      const q = (focus.s ? '[data-c="' + focus.s + '"] ' : '') + '[data-k="' + focus.k + '"]';
       const elx = $(q, box);
       if (elx && !elx.disabled) {
         if (focus.v !== null && isTextInput(elx)) elx.value = focus.v;
@@ -1981,8 +2062,8 @@
   function applyField(t) {
     if (!M.open || !t || !t.dataset.k || !$('#figSettings').contains(t)) return;
     const k = t.dataset.k;
-    const sEl = t.closest('[data-s]');
-    const sLine = sEl ? +sEl.dataset.s : null;
+    const sEl = t.closest('[data-c]');
+    const ord = sEl ? +sEl.dataset.c : null;
     // export – nastavení aplikace, ne graf
     if (k === 'exportW' || k === 'exportH') {
       const n = Number(numTxt(t.value));
@@ -2025,7 +2106,7 @@
       editDraft((lines, f) => PC.setLim(lines, f, fn, vals[0], vals[1], side));
       return;
     }
-    const key = fieldKey(k, sLine);
+    const key = fieldKey(k, ord);
     const val = t.value;
     let bad = '';
     if (k === 'dt') { const dt = Number(numTxt(val)); if (!NUM_OK.test(numTxt(val)) || !(dt > 0)) bad = 'Perioda musí být kladné číslo, např. 0.01'; }
@@ -2036,13 +2117,29 @@
     if (val === t.defaultValue) { renderMenu(); renderBar(); return; }   // beze změny
     if (sEl) {
       const li = +sEl.dataset.li;
-      const ch = k === 'width' ? { width: numTxt(val) } : { label: val, labelIndex: li };
-      editDraft((lines, f) => PC.setSeries(lines, f, sLine, ch));
+      if (k === 'dt') {
+        // vlastní perioda křivky (sdílený časový vektor staršího grafu se rozdělí)
+        const dt = String(+Number(numTxt(val)).toPrecision(12));
+        editDraft((lines, f) => PC.setCurveData(lines, f, ord, { kind: 'time', dt }, undefined, Object.keys(S.scope)));
+        return;
+      }
+      const ln = fig.ax.lines[li];
+      const ch = k === 'width' ? { width: numTxt(val) }
+        : { label: val, labelIndex: li, defName: ln ? ln.yname || ln.ytext : '', names: lineNames(fig), legendOn: !!(fig.ax.legend && fig.ax.legend.visible) };
+      editDraft((lines, f) => PC.setSeries(lines, f, ord, ch));
       return;
     }
-    if (k === 'dt') { const dt = Number(numTxt(val)); editDraft((lines, f) => PC.setTimeDt(lines, f, String(+dt.toPrecision(12)))); return; }
-    if (k === 'title' || k === 'xlabel' || k === 'ylabel') { editDraft((lines, f) => PC.setText(lines, f, k, val, 'left')); return; }
-    if (k === 'y2label') { editDraft((lines, f) => PC.setText(lines, f, 'ylabel', val, 'right')); return; }
+    if (k === 'title') { editDraft((lines, f) => PC.setText(lines, f, 'title', val, 'left')); return; }
+    // popisek os = text + [jednotky]
+    const AXL = { xlabel: ['xlabel', 'left'], ylabel: ['ylabel', 'left'], y2label: ['ylabel', 'right'] };
+    const base = k.replace(/Unit$/, '');
+    if (AXL[base]) {
+      const sec = t.closest('.fs-sec');
+      const nm = $('[data-k="' + base + '"]', sec);
+      const un = $('[data-k="' + base + 'Unit"]', sec);
+      const text = joinUnit(nm ? nm.value : '', un ? un.value : '');
+      editDraft((lines, f) => PC.setText(lines, f, AXL[base][0], text, AXL[base][1]));
+    }
   }
 
   // rozepsané pole s fokusem do návrhu (před zavřením, uložením…)
@@ -2058,27 +2155,67 @@
     if (k === 'exportScale') { S.data.ui.exportScale = Number(val) || DEFAULT_UI.exportScale; save(); return; }
     const c = menuCtx();
     if (!c.fig || !c.editable) return;
-    const sEl = t.closest('[data-s]');
+    const sEl = t.closest('[data-c]');
     if (sEl) {
-      const line = +sEl.dataset.s;
-      if (k === 'y') {
-        const prob = lenProblem(c.xName, yLens([val]));
-        if (prob) { toast(prob, true); renderMenu(); return; }
-        editDraft((lines, f) => PC.setSeries(lines, f, line, { y: val }));
-      } else if (k === 'color') editDraft((lines, f) => PC.setSeries(lines, f, line, { color: val }));
-      else if (k === 'ls') editDraft((lines, f) => PC.setSeries(lines, f, line, { ls: val }));
-      else if (k === 'marker') editDraft((lines, f) => PC.setSeries(lines, f, line, { marker: val }));
-      else if (k === 'side') editDraft((lines, f) => PC.setSide(lines, f, line, val));
+      const ord = +sEl.dataset.c;
+      const ln = c.fig.ax.lines[+sEl.dataset.li];
+      if (k === 'x' || k === 'y') curveXY(ord, k, val);
+      else if (k === 'color') editDraft((lines, f) => PC.setSeries(lines, f, ord, { color: val }));
+      else if (k === 'ls') editDraft((lines, f) => PC.setSeries(lines, f, ord, { ls: val }));
+      else if (k === 'marker') editDraft((lines, f) => PC.setSeries(lines, f, ord, { marker: val }));
+      else if (k === 'side') {
+        remapCurveKeys(() => null);       // pořadí křivek se mění
+        editDraft((lines, f) => PC.setSide(lines, f, ord, val));
+      }
       return;
     }
-    if (k === 'x') { if (val === '@time') chooseTime(); else if (val !== '*') setX(val || null, true); return; }
     if (k === 'xlog') { editDraft((lines, f) => PC.setScale(lines, f, 'x', val)); return; }
     if (k === 'ylog') { editDraft((lines, f) => PC.setScale(lines, f, 'y', val, 'left')); return; }
     if (k === 'y2log') { editDraft((lines, f) => PC.setScale(lines, f, 'y', val, 'right')); return; }
     if (k === 'grid' || k === 'box') { editDraft((lines, f) => PC.setFlag(lines, f, k, val)); return; }
     if (k === 'tight') { editDraft((lines, f) => PC.setTight(lines, f, val)); return; }
-    if (k === 'legend') { editDraft((lines, f) => PC.setLegend(lines, f, val, null)); return; }
-    if (k === 'legendLoc') { editDraft((lines, f) => PC.setLegend(lines, f, true, val)); }
+    if (k === 'legend') { editDraft((lines, f) => PC.setLegend(lines, f, val, null, lineNames(f))); return; }
+    if (k === 'legendLoc') { editDraft((lines, f) => PC.setLegend(lines, f, true, val, lineNames(f))); }
+  }
+
+  /**
+   * Změna X nebo Y jedné křivky v menu. Délka se kontroluje jen v rámci této dvojice:
+   * když nesedí, výběr zůstane v kartě křivky červeně s vysvětlením (M.raw), do kódu
+   * ani do grafu nejde. Jakmile se druhá polovina dvojice změní tak, že délky sedí, zapíše se obojí.
+   */
+  async function curveXY(ord, k, val) {
+    const c = menuCtx();
+    const cv = c.curves && c.curves[ord];
+    if (!cv || cv.ro) return;
+    const kx = fieldKey('x', ord);
+    const ky = fieldKey('y', ord);
+    const ke = fieldKey('xy', ord);
+    const xs0 = PC.xOf(c.g, cv.p);
+    const xCode = xs0.kind === 'index' ? '' : xs0.kind === 'time' ? '@time' : xs0.name;
+    const yCode = cv.p.y.text;
+    const xVal = k === 'x' ? val : has(M.raw, kx) ? M.raw[kx] : xCode;
+    const yVal = k === 'y' ? val : has(M.raw, ky) ? M.raw[ky] : yCode;
+    let dt = xs0.kind === 'time' ? xs0.dt : null;
+    if (xVal === '@time' && xCode !== '@time') {
+      dt = await askDt();
+      if (dt === null) { renderMenu(); return; }
+    }
+    const err = pairProblem(xVal, yVal);
+    if (err) {
+      if (xVal !== xCode) M.raw[kx] = xVal; else delete M.raw[kx];
+      if (yVal !== yCode) M.raw[ky] = yVal; else delete M.raw[ky];
+      M.fieldBad[ke] = err;
+      renderMenu();
+      renderBar();
+      return;
+    }
+    delete M.raw[kx];
+    delete M.raw[ky];
+    delete M.fieldBad[ke];
+    const xs = xVal === xCode ? undefined : xVal === '' ? { kind: 'index' } : xVal === '@time' ? { kind: 'time', dt } : { kind: 'var', name: xVal };
+    const y = yVal !== yCode ? yVal : undefined;
+    if (xs === undefined && y === undefined) { renderMenu(); renderBar(); return; }
+    editDraft((lines, f) => PC.setCurveData(lines, f, ord, xs, y, Object.keys(S.scope)));
   }
 
   // barva z výběru barev: při tažení v paletě nejvýš jedna změna na snímek
@@ -2114,8 +2251,9 @@
       if (!b || b.tagName === 'SELECT') return;
       const act = b.dataset.act;
       if (act === 'del-series') {
-        const line = +b.closest('[data-s]').dataset.s;
-        editDraft((lines, f) => PC.deleteStmt(lines, line, f));
+        const ord = +b.closest('[data-c]').dataset.c;
+        remapCurveKeys((k) => (k === ord ? null : k > ord ? k - 1 : k));
+        editDraft((lines, f) => PC.deleteCurve(lines, f, ord));
       } else if (act === 'png' || act === 'svg') exportFig(act);
       else if (act === 'new-fig') { closeMenu(); addFigure(); }
     });
@@ -2472,7 +2610,10 @@
       'Text v poli (popisky, rozsahy, perioda…) se projeví po <kbd>Enter</kbd> nebo opuštění pole, přepínače a výběry hned. Neplatná hodnota zčervená a graf zůstane na poslední platné verzi. ' +
       'S vypnutým <b>Živým náhledem</b> se graf překreslí až zeleným tlačítkem <b>Překreslit</b>. Do kódu změny zapíše <b>Zapsat do kódu</b> nebo <kbd>⌘</kbd> <kbd>S</kbd>; <b>Zrušit</b> vrátí graf do stavu před otevřením menu. ' +
       'Menu zavřeš klikem kamkoliv mimo něj nebo <kbd>Esc</kbd>; s neuloženými změnami se zeptá (Uložit / Zahodit / Pokračovat v úpravách). Ten klik nic jiného neudělá. ' +
-      'U každé křivky jde zvolit levou nebo pravou (vedlejší) osu Y – v kódu je to ' + c('yyaxis right') + '. ' +
+      'Osy (X, Y vlevo i vpravo) mají jen vzhled: popisek, jednotky, rozsah, logaritmické měřítko. ' +
+      'Data má každá <b>křivka</b> svoje: X (proměnná, index vzorku, nebo čas z periody s vlastní periodou), Y, osa Y (levá / pravá – v kódu ' + c('yyaxis right') + '), čáru (plná, čárkovaná… nebo bez), body (○ □ × ✱ … nebo bez), barvu a název do legendy. ' +
+      'Nová křivka převezme X předchozí. Délka se kontroluje jen mezi X a Y jedné křivky, chyba je u ní – různé křivky můžou mít různě dlouhá data (8 naměřených bodů a 200 bodů proložení). ' +
+      'V kódu jsou křivky dvojice: ' + c("plot(t, y, 'o', tHladka, yfit, '-')") + ', jména pak v ' + c("legend('měření', 'proložení')") + '. ' +
       'Ručně psané složitější řádky (výrazy, ' + c('sprintf') + ', víc příkazů na řádku) panel jen ukáže – ty uprav v editoru. Grafy mimo blok %% Grafy jsou v panelu jen pro čtení. ' +
       'Export: PNG, SVG, nebo obrázek či data do schránky – obrázek je vždy světlý, i v tmavém režimu. ' +
       'Zoom: táhni myší (jen dočasný pohled, do kódu se nezapisuje). Dvojklik nebo domeček v liště grafu vrátí rozsah z kódu (' + c('xlim') + ' / ' + c('ylim') + '); se samotným ' + c('xlim') + ' se osa Y přizpůsobí datům v tomto rozsahu.</p>' +
@@ -2481,7 +2622,7 @@
       row('klik na záhlaví sloupce', 'pojmenuje sloupec – celý sloupec je pak v kódu vektor (ve Workspace s 📊). Nečíselné a prázdné hodnoty jsou NaN') +
       row(c('M = load("mereni.txt")'), 'celá matice ze souboru nahraného v okně Data (stejné volby jako v okně)') +
       row(c('prutok = prutok * 2'), 'přiřazení do datové proměnné ji zastíní jen pro daný běh – uložená data zůstanou. ' + c('clear') + ' datové proměnné nesmaže') +
-      row('graf', 'datové proměnné jdou na osy jako jiné vektory. Osa X může být i <b>čas z periody vzorkování</b> (Nastavení → Osa X), zapíše se ' + c('t = (0:numel(y)-1)*0.01;')) +
+      row('graf', 'datové proměnné jdou na osy jako jiné vektory. X křivky může být i <b>čas z periody vzorkování</b> (Nastavení → Křivky → X), zapíše se ' + c('t = (0:numel(y)-1)*0.01;') + ' – každá křivka má vlastní vektor a periodu') +
       '</table><p class="muted">Data se ukládají v prohlížeči (IndexedDB) a fungují i offline. Přejmenovat a smazat je jde v okně Data nebo pravým klikem ve Workspace.</p>' +
       '<h4>Klávesy</h4><table>' +
       row('<kbd>⌘</kbd> <kbd>↵</kbd> / <kbd>Ctrl</kbd> <kbd>↵</kbd> / <kbd>F5</kbd>', 'spustit celý skript') +
@@ -2549,7 +2690,7 @@
     const bad = [];
     if (!G.FUNCS || !G.FUNCS.has('yyaxis')) bad.push('js/graphics.js');
     if (!P.resetView) bad.push('js/plot.js');
-    if (!PC.setSide || !PC.sideMap) bad.push('js/plotcode.js');
+    if (!PC.curvesOf || !PC.sideMap) bad.push('js/plotcode.js');
     if (!$('#fsLive') || !$('#btnTheme')) bad.push('index.html');
     if (!getComputedStyle(document.documentElement).getPropertyValue('--accent-fill').trim()) bad.push('css/style.css');
     return bad;

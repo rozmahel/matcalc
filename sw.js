@@ -10,7 +10,7 @@
    takže se nikdy nesmíchají staré a nové (stará verze js/graphics.js
    s novou js/app.js).
    ===================================================================== */
-const VERSION = '4';
+const VERSION = '5';
 const CACHE = 'matcalc-v' + VERSION;
 const V = '?v=' + VERSION;
 
