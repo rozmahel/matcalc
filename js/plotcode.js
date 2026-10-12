@@ -12,6 +12,11 @@
 
    Všechny operace mění pole řádků (lines, číslováno od 0) na místě;
    čísla řádků v příkazech jsou od 1 jako v editoru.
+
+   Vedlejší osa Y: skupina se dělí příkazy „yyaxis left / right“ na úseky.
+   Řádky před prvním yyaxis patří levé straně. ylabel, ylim a YScale se
+   píšou do úseku své strany, ostatní (title, xlabel, legend…) platí pro
+   celý graf a přidávají se na konec skupiny.
    ===================================================================== */
 (function () {
   'use strict';
@@ -133,12 +138,64 @@
   }
   const serializeSet = (m) => 'set(gca, ' + m.pairs.map(([n, v]) => q(n) + ', ' + v.text).join(', ') + ')';
 
+  // časová osa z periody vzorkování: t = (0:numel(y)-1)*0.01
+  const TIME_RE = /^([A-Za-z_]\w*)\s*=\s*\(\s*0\s*:\s*(?:numel|length)\s*\(\s*([A-Za-z_]\w*)\s*\)\s*-\s*1\s*\)\s*\*\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)$/;
+  function timeModel(st) {
+    if (!st || st.call || !st.single) return null;
+    const m = String(st.code).match(TIME_RE);
+    return m ? { st, name: m[1], ref: m[2], dt: m[3] } : null;
+  }
+  function timeOf(g) {
+    for (const st of g.stmts) { const t = timeModel(st); if (t) return t; }
+    return null;
+  }
+
   const word = (st) => (st.call.args[0] ? lc(st.call.args[0].value) : '');
   const isHoldOn = (st) => st.call && st.call.fn === 'hold' && st.simple && ['on', 'all'].includes(word(st));
   const isTight = (st) => st.call && st.call.fn === 'axis' && st.simple && st.call.args.length === 1 && word(st) === 'tight';
+  const isPlot = (st) => !!(st.call && G.PLOT_FNS.has(st.call.fn));
+
+  /* ---------- strany osy Y (yyaxis) ---------- */
+  // jednoduché „yyaxis left|right“ -> 'left' | 'right', jinak null
+  function yyWord(st) {
+    if (!st || !st.call || st.call.fn !== 'yyaxis' || !st.simple) return null;
+    const a = st.call.args.filter((x) => !(x.kind === 'ident' && x.text === 'gca'));
+    if (a.length !== 1 || a[0].kind !== 'str') return null;
+    const w = lc(a[0].value);
+    return w === 'left' || w === 'right' ? w : null;
+  }
+  const isYy = (st) => !!(st.call && st.call.fn === 'yyaxis');
+  // strana každého příkazu skupiny (Map st -> 'left' | 'right'); příkaz yyaxis patří už nové straně
+  function sideMap(g) {
+    const m = new Map();
+    let side = 'left';
+    g.stmts.forEach((st) => {
+      if (isYy(st)) side = yyWord(st) || side;
+      m.set(st, side);
+    });
+    return m;
+  }
+  const hasYy = (g) => g.stmts.some(isYy);
+  const sideOf = (g, st) => sideMap(g).get(st) || 'left';
+  // má skupina pravou osu (příkaz yyaxis)? – v MATLABu ji přidá i yyaxis left
+  const hasRight = (g) => hasYy(g);
+
+  // vloží řádek(y) na konec úseku dané strany; když úsek není, přidá „yyaxis …“ na konec skupiny
+  function insertSide(lines, g, side, texts) {
+    texts = [].concat(texts);
+    const ind = indentOf(lines, g);
+    if (!hasYy(g)) { appendToGroup(lines, g, texts); return; }
+    const sm = sideMap(g);
+    const mine = g.stmts.filter((st) => sm.get(st) === side);
+    if (mine.length) { insertAfter(lines, Math.max(...mine.map((st) => st.endLine)), texts, ind); return; }
+    insertAfter(lines, g.last, ['yyaxis ' + side].concat(texts), ind);
+  }
+  // je před řádkem pos (od 1) ve skupině „hold on“?
+  const holdBefore = (g, pos) => g.stmts.some((st) => isHoldOn(st) && st.endLine < pos);
 
   // Řádky, které panel umí zobrazit a měnit (ostatní ukáže jen pro čtení)
   function represented(st) {
+    if (timeModel(st)) return true;
     if (!st.call || !st.simple) return false;
     const fn = st.call.fn;
     const n = st.call.args.length;
@@ -152,6 +209,7 @@
     if (fn === 'xlim' || fn === 'ylim') return n === 1 && ((st.call.args[0].kind === 'vec' && st.call.args[0].value.length === 2) || word(st) === 'auto');
     if (fn === 'axis') return isTight(st);
     if (fn === 'set') { const m = setModel(st); return !!(m && m.pairs.every(([k]) => ['xscale', 'yscale'].includes(lc(k)))); }
+    if (fn === 'yyaxis') return !!yyWord(st);
     return false;
   }
 
@@ -195,10 +253,16 @@
     return { an, g };
   }
 
-  // title / xlabel / ylabel
-  function setText(lines, fig, fn, value) {
+  // řádky dané funkce na dané straně (pro ylabel / ylim; x a title side nemají)
+  const onSide = (g, list, side) => { if (!side) return list; const sm = sideMap(g); return list.filter((s) => sm.get(s) === side); };
+  // příkaz osy Y se přidá do úseku své strany, ostatní na konec skupiny
+  const addFor = (lines, g, side, text) => (side ? insertSide(lines, g, side, text) : appendToGroup(lines, g, text));
+
+  // title / xlabel / ylabel; side = 'left' | 'right' jen u ylabel
+  function setText(lines, fig, fn, value, side) {
     const { g } = ctxFor(lines, fig);
-    const st = byFn(g, fn).filter((s) => represented(s)).pop();
+    side = fn === 'ylabel' ? side || 'left' : null;
+    const st = onSide(g, byFn(g, fn), side).filter((s) => represented(s)).pop();
     if (st) {
       if (value === '' && st.call.args.length === 1) { deleteLine(lines, st.line); return; }
       const args = st.call.args.map((a) => a.text);
@@ -206,27 +270,29 @@
       replaceStmt(lines, st, fn + '(' + args.join(', ') + ')');
       return;
     }
-    if (value !== '') appendToGroup(lines, g, fn + '(' + q(value) + ')');
+    if (value !== '') addFor(lines, g, side, fn + '(' + q(value) + ')');
   }
 
-  // xlim / ylim; lo, hi jako text ('' = automaticky)
-  function setLim(lines, fig, fn, lo, hi) {
+  // xlim / ylim; lo, hi jako text ('' = automaticky); side jen u ylim
+  function setLim(lines, fig, fn, lo, hi, side) {
     const { g } = ctxFor(lines, fig);
-    const st = byFn(g, fn).filter((s) => represented(s)).pop();
+    side = fn === 'ylim' ? side || 'left' : null;
+    const st = onSide(g, byFn(g, fn), side).filter((s) => represented(s)).pop();
     const p = (s, inf) => { const t = String(s).trim().replace(',', '.'); return t === '' ? inf : t; };
     const empty = String(lo).trim() === '' && String(hi).trim() === '';
     const code = fn + '([' + p(lo, '-Inf') + ' ' + p(hi, 'Inf') + '])';
     if (st) { if (empty) deleteLine(lines, st.line); else replaceStmt(lines, st, code); return; }
-    if (!empty) appendToGroup(lines, g, code);
+    if (!empty) addFor(lines, g, side, code);
   }
 
-  // logaritmická osa: set(gca, 'XScale', …) nebo přepnutí semilogx/semilogy/loglog
-  function setScale(lines, fig, axis, log) {
+  // logaritmická osa: set(gca, 'XScale', …) nebo přepnutí semilogx/semilogy/loglog; side jen u osy y
+  function setScale(lines, fig, axis, log, side) {
     const { g } = ctxFor(lines, fig);
+    side = axis === 'y' ? side || 'left' : null;
     const key = axis.toUpperCase() + 'Scale';
     const want = log ? 'log' : 'linear';
-    const sets = g.stmts.filter((s) => setModel(s) && setModel(s).pairs.some(([k]) => lc(k) === lc(key)));
-    const plots = g.stmts.filter((s) => plotModel(s));
+    const sets = onSide(g, g.stmts.filter((s) => setModel(s) && setModel(s).pairs.some(([k]) => lc(k) === lc(key))), side);
+    const plots = onSide(g, g.stmts.filter((s) => plotModel(s)), side);
     const logFns = axis === 'x' ? ['semilogx', 'loglog'] : ['semilogy', 'loglog'];
     if (sets.length) {
       const st = sets[sets.length - 1];
@@ -245,7 +311,7 @@
         return;
       }
     }
-    appendToGroup(lines, g, 'set(gca, ' + q(key) + ', ' + q(want) + ')');
+    addFor(lines, g, side, 'set(gca, ' + q(key) + ', ' + q(want) + ')');
   }
 
   // grid / box: on/off. Výchozí stav (grid off, box on) řádek smaže.
@@ -260,11 +326,15 @@
     appendToGroup(lines, g, fn + ' ' + (on ? 'on' : 'off'));
   }
 
+  // axis tight; s vedlejší osou platí jen pro aktivní stranu, proto se zapíše do úseku každé strany
   function setTight(lines, fig, on) {
-    const { g } = ctxFor(lines, fig);
-    const st = g.stmts.filter(isTight);
-    if (on) { if (!st.length) appendToGroup(lines, g, 'axis tight'); return; }
-    st.slice().reverse().forEach((s) => deleteLine(lines, s.line));
+    let { g } = ctxFor(lines, fig);
+    if (!on) { g.stmts.filter(isTight).reverse().forEach((s) => deleteLine(lines, s.line)); return; }
+    if (!hasYy(g)) { if (!g.stmts.some(isTight)) appendToGroup(lines, g, 'axis tight'); return; }
+    ['right', 'left'].forEach((side) => {
+      ({ g } = ctxFor(lines, fig));
+      if (!onSide(g, g.stmts.filter(isTight), side).length) insertSide(lines, g, side, 'axis tight');
+    });
   }
 
   // legenda: viditelnost a poloha. Při zapnutí doplní DisplayName podle názvu proměnné.
@@ -335,7 +405,73 @@
     if (legendEdit) replaceStmt(lines, legendEdit.s, serializeLegend(legendEdit.m));
   }
 
-  function deleteStmt(lines, lineNo) { deleteLine(lines, lineNo); }
+  function deleteStmt(lines, lineNo, fig) {
+    deleteLine(lines, lineNo);
+    if (fig) cleanupRight(lines, fig);
+  }
+
+  /**
+   * Přesune řádek plot na levou / pravou osu Y (yyaxis). Na pravou ho dá za poslední
+   * křivku vpravo (nebo za „yyaxis right“, případně ho na konec skupiny přidá),
+   * na levou za poslední křivku vlevo. Když vpravo nic nezbude, pravá osa zmizí.
+   */
+  function setSide(lines, fig, stmtLine, side) {
+    let { g } = ctxFor(lines, fig);
+    const st = g.stmts.find((s) => s.line === stmtLine);
+    if (!st || !plotModel(st) || !st.single) throw new Error('Řádek ' + stmtLine + ' je ručně psaný – uprav ho v editoru');
+    const sm = sideMap(g);
+    if (sm.get(st) === side) return;
+    if (g.stmts.some((s) => isYy(s) && !yyWord(s))) throw new Error('Ve skupině je ručně psaný příkaz yyaxis – stranu změň v editoru');
+    if (st.line === g.start) throw new Error('Graf začíná tímto řádkem – přidej nad něj „figure“, pak jde křivka přesunout');
+    const text = lines[st.line - 1];
+    const plain = text.replace(/^\s*/, '');
+    deleteLine(lines, st.line);
+    ({ g } = ctxFor(lines, fig));
+    const ind = indentOf(lines, g);
+    const sm2 = sideMap(g);
+    const plots = g.stmts.filter((s) => isPlot(s) && sm2.get(s) === side);
+    let at;
+    if (plots.length) at = plots[plots.length - 1].endLine;
+    else if (side === 'right') {
+      const yy = g.stmts.filter((s) => yyWord(s) === 'right');
+      if (!yy.length) { insertAfter(lines, g.last, ['yyaxis right', plain], ind); return; }
+      at = yy[yy.length - 1].endLine;
+    } else {
+      // za úvodní figure / hold / yyaxis left na začátku skupiny
+      let k = 0;
+      while (k + 1 < g.stmts.length && g.stmts[k + 1].call && ['figure', 'hold'].includes(g.stmts[k + 1].call.fn)) k++;
+      at = g.stmts[k].endLine;
+      if (sm2.get(g.stmts[k]) !== 'left') {
+        const yl = g.stmts.filter((s) => yyWord(s) === 'left');
+        if (!yl.length) { insertAfter(lines, g.last, ['yyaxis left', plain], ind); return; }
+        at = yl[yl.length - 1].endLine;
+      }
+    }
+    // druhá křivka na stejné straně potřebuje hold on (jinak by první nahradila)
+    const add = [];
+    if (plots.length && !holdBefore(g, at + 1)) add.push(ind + 'hold on');
+    add.push(text);
+    lines.splice(at, 0, ...add);
+    if (side === 'left') cleanupRight(lines, fig);
+  }
+
+  /**
+   * Když na pravé ose nezůstala žádná křivka, smaže „yyaxis“ a nastavení pravé osy
+   * (ylabel, ylim, YScale, axis tight vpravo). Ručně psané řádky vpravo – nic nemaže.
+   */
+  function cleanupRight(lines, fig) {
+    let g;
+    try { ({ g } = ctxFor(lines, fig)); } catch (e) { return; }
+    if (!hasYy(g) || g.stmts.some((s) => isYy(s) && !yyWord(s))) return;
+    const sm = sideMap(g);
+    if (g.stmts.some((s) => isPlot(s) && sm.get(s) === 'right')) return;
+    const right = g.stmts.filter((s) => sm.get(s) === 'right' && !isYy(s));
+    const yOnly = (s) => s.call && (['ylabel', 'ylim'].includes(s.call.fn) || isTight(s) ||
+      (s.call.fn === 'set' && setModel(s) && setModel(s).pairs.every(([k]) => lc(k) === 'yscale')));
+    if (right.some((s) => !represented(s) || (s.call && ['set', 'axis'].includes(s.call.fn) && !yOnly(s)))) return;
+    const del = g.stmts.filter((s) => (isYy(s) && s.line !== g.start) || (sm.get(s) === 'right' && yOnly(s) && s.single));
+    del.map((s) => s.line).sort((a, b) => b - a).forEach((l) => deleteLine(lines, l));
+  }
 
   // společná osa X jednoduchých řádků plot ('' = index, null = různé / žádné)
   function commonX(g) {
@@ -361,23 +497,75 @@
       changed++;
     });
     dels.reverse().forEach((l) => deleteLine(lines, l));
+    dropUnusedTime(lines, fig);
     return { changed, skipped };
   }
 
-  // přidá křivky plot(x, název) – za poslední plot, případně doplní hold on
+  // řádek s časovou osou, kterou už nic ve skupině nepoužívá, zmizí
+  function dropUnusedTime(lines, fig) {
+    const { g } = ctxFor(lines, fig);
+    const times = g.stmts.map(timeModel).filter(Boolean);
+    const dead = times.filter((t) => !g.stmts.some((s) => s !== t.st && new RegExp('(^|[^A-Za-z0-9_])' + t.name + '([^A-Za-z0-9_]|$)').test(s.code)));
+    dead.reverse().forEach((t) => deleteLine(lines, t.st.line));
+  }
+
+  /**
+   * Osa X jako čas z periody vzorkování: vloží (nebo upraví) řádek
+   * t = (0:numel(y)-1)*dt před první plot a nastaví t na osu X.
+   * taken = názvy, které už ve workspace jsou (aby se nepřepsala jiná proměnná t)
+   */
+  function setTimeX(lines, fig, dt, taken) {
+    const { g } = ctxFor(lines, fig);
+    const plots = g.stmts.filter((s) => s.call && G.PLOT_FNS.has(s.call.fn));
+    const models = plots.map(plotModel).filter((m) => m && m.editable);
+    if (!models.length) throw new Error('Nejdřív přidej křivku na osu Y – délka časového vektoru se odvodí z ní');
+    const tm = timeOf(g);
+    let name;
+    if (tm) {
+      name = tm.name;
+      replaceStmt(lines, tm.st, name + ' = (0:numel(' + tm.ref + ')-1)*' + dt);
+    } else {
+      const ref = models[0].y.text;
+      const used = new Set(taken || []);
+      const cands = ['t', 't_' + ref];
+      for (let k = 2; k < 50; k++) cands.push('t' + k);
+      name = cands.find((c) => !used.has(c) && c !== ref);
+      insertAfter(lines, plots[0].line - 1, name + ' = (0:numel(' + ref + ')-1)*' + dt + ';', indentOf(lines, g));
+    }
+    return setX(lines, fig, name);
+  }
+
+  // změna periody u existující časové osy
+  function setTimeDt(lines, fig, dt) {
+    const { g } = ctxFor(lines, fig);
+    const tm = timeOf(g);
+    if (!tm) throw new Error('Graf nemá časovou osu');
+    replaceStmt(lines, tm.st, tm.name + ' = (0:numel(' + tm.ref + ')-1)*' + dt);
+  }
+
+  // přidá křivky plot(x, název) – za poslední plot na levé ose, případně doplní hold on
   function addY(lines, fig, names, xname, withNames) {
     names.forEach((n) => {
       const { g } = ctxFor(lines, fig);
       const m = { fn: 'plot', x: xname ? { kind: 'ident', text: xname } : null, y: { kind: 'ident', text: n }, spec: {}, opts: [] };
       if (withNames) setOpt(m, 'DisplayName', q(n));
       const ind = indentOf(lines, g);
-      let after = lastPlotLine(g);
+      const sm = sideMap(g);
+      const lefts = g.stmts.filter((s) => isPlot(s) && sm.get(s) === 'left');
+      let after = hasYy(g) ? (lefts.length ? lefts[lefts.length - 1].endLine : null) : lastPlotLine(g);
       if (after !== null) {
-        if (!g.stmts.some(isHoldOn)) { insertAfter(lines, after, 'hold on', ind); after++; }
+        if (!holdBefore(g, after + 1)) { insertAfter(lines, after, 'hold on', ind); after++; }
       } else {
         // za figure / hold on na začátku skupiny
-        const lead = g.stmts.filter((s, k) => k === 0 || (s.call && ['hold', 'figure'].includes(s.call.fn)));
-        after = Math.max(...lead.map((s) => s.endLine));
+        let k = 0;
+        while (k + 1 < g.stmts.length && g.stmts[k + 1].call && ['figure', 'hold'].includes(g.stmts[k + 1].call.fn)) k++;
+        after = g.stmts[k].endLine;
+        // v grafu s yyaxis ještě před první křivku vpravo (aby nová křivka byla vlevo)
+        if (sm.get(g.stmts[k]) === 'right') {
+          const yl = g.stmts.filter((s) => yyWord(s) === 'left');
+          if (yl.length) after = yl[yl.length - 1].endLine; else { insertAfter(lines, g.last, ['yyaxis left', serializePlot(m)], ind); return; }
+        }
+        if (g.stmts.some((s) => isPlot(s) && s.endLine <= after) && !holdBefore(g, after + 1)) { insertAfter(lines, after, 'hold on', ind); after++; }
       }
       insertAfter(lines, after, serializePlot(m), ind);
     });
@@ -396,6 +584,7 @@
       else if (m.x && names.includes(m.x.text)) { m.x = null; edits.push({ line: s.line, st: s, code: serializePlot(m) }); }
     });
     edits.sort((a, b) => b.line - a.line).forEach((e) => { if (e.del) deleteLine(lines, e.line); else replaceStmt(lines, e.st, e.code); });
+    cleanupRight(lines, fig);
     return { skipped };
   }
 
@@ -525,8 +714,10 @@
   MC.plotcode = {
     HEADER, HEADER_RE, SECTION_RE,
     analyze, groupOf, byFn, plotModel, legendModel, setModel, represented, commonX, isTight,
-    setText, setLim, setScale, setFlag, setTight, setLegend, setSeries, deleteStmt,
+    sideMap, sideOf, hasRight, yyWord,
+    setText, setLim, setScale, setFlag, setTight, setLegend, setSeries, setSide, deleteStmt, cleanupRight,
     setX, addY, removeVars, newFigure, removeFigure, ensureBlock,
+    timeModel, timeOf, setTimeX, setTimeDt,
     migrate, fromOldFigure, htmlToTex, q,
   };
 })();

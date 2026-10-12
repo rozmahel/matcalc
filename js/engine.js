@@ -160,6 +160,18 @@
       const s = sprintf(String(fmt), args).replace(/\n$/, '');
       if (currentOut) currentOut.push({ type: 'disp', text: s, line: currentLine });
     },
+    // chybějící hodnoty (NaN) – hlavně u importovaných dat
+    isnan: (x) => mapAny(x, (v) => (typeof v === 'number' ? (Number.isNaN(v) ? 1 : 0) : math.isNaN(v) ? 1 : 0)),
+    rmmissing(x) {
+      if (!isMat(x)) return Number.isNaN(num(x)) ? math.matrix([]) : x;
+      return math.matrix(flat(x).filter((v) => !(typeof v === 'number' ? Number.isNaN(v) : math.isNaN(v))));
+    },
+    // M = load("soubor.txt") – matice ze souboru nahraného v okně Data (stejný parser jako import)
+    load(name) {
+      if (typeof name !== 'string') throw new Error('load: název souboru zadej jako text, např. load("mereni.txt")');
+      if (!MC.data) throw new Error('load: import dat není k dispozici');
+      return MC.data.loadMatrix(name);
+    },
     // násobení: dva vektory přes * jsou v MATLABu chyba, math.js by tiše spočítal skalární součin
     mtimes(a, b) {
       if (math.isMatrix(a) && math.isMatrix(b) && a.size().length === 1 && b.size().length === 1) {
@@ -670,6 +682,8 @@
    * opts.lineOffset – posun čísel řádků (pro „spustit výběr“)
    * opts.meta – { funcs: {} } zdrojové texty uživatelských funkcí
    * opts.gfx – stav grafů (MC.graphics.newState()), do kterého kreslí plot, title…
+   * opts.data – { names: Set, restore(scope) } datové proměnné: přiřazení do nich je zastíní jen
+   *   pro tento běh (vypíše se nenápadné upozornění), clear je vrátí zpět
    * Vrací { outputs, error, count, ms }
    */
   function run(src, scope, opts) {
@@ -677,6 +691,8 @@
     const meta = opts.meta || { funcs: {} };
     const lineOffset = opts.lineOffset || 0;
     const gfx = opts.gfx || (MC.graphics ? MC.graphics.newState() : null);
+    const data = opts.data || null;
+    const shadowed = new Set();
     const outputs = [];
     const t0 = performance.now();
     let count = 0;
@@ -700,6 +716,7 @@
         if ((m = code.match(/^(?:clear|clearvars)(?:\s+(.*))?$/))) {
           const names = (m[1] || 'all').trim().split(/\s+/);
           if (names.includes('all') || names.includes('-all')) { Object.keys(scope).forEach((k) => delete scope[k]); meta.funcs = {}; } else names.forEach((nm) => { delete scope[nm]; delete meta.funcs[nm]; });
+          if (data) data.restore(scope);   // datové proměnné jsou pořád k dispozici (uložená data clear nesmaže)
           outputs.push({ type: 'clear', line });
           count++;
           continue;
@@ -730,6 +747,13 @@
         const node = prepare(code, scope);
         const value = node.compile().evaluate(scope);
         count++;
+
+        const asg = node.type === 'FunctionAssignmentNode' ? node.name
+          : node.type === 'AssignmentNode' && node.object && node.object.name ? node.object.name : null;
+        if (asg && data && data.names.has(asg) && !shadowed.has(asg)) {
+          shadowed.add(asg);
+          outputs.push({ type: 'shadow', name: asg, line });
+        }
 
         if (node.type === 'FunctionAssignmentNode') {
           meta.funcs[node.name] = code;

@@ -6,6 +6,15 @@
   <title>MatCalc</title>
   <meta name="description" content="Lehká kalkulačka ve stylu MATLABu na rychlé, opakované výpočty a grafy.">
   <meta name="theme-color" content="#eef1f4">
+  <script>
+    /* světlý / tmavý režim ještě před vykreslením stránky (aby neblikla); volba z tlačítka Tmavý, jinak podle systému */
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem('matcalc:theme'); } catch (e) { /* úložiště blokované */ }
+      if (t !== 'dark' && t !== 'light') t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="icons/favicon-16.png">
@@ -16,7 +25,8 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="stylesheet" href="vendor/codemirror/codemirror.css">
   <link rel="stylesheet" href="vendor/codemirror/show-hint.css">
-  <link rel="stylesheet" href="css/style.css">
+  <!-- ?v= je verze aplikace: při nahrání nové verze zvyš číslo tady i ve sw.js (VERSION), aby prohlížeč nevzal staré soubory z mezipaměti -->
+  <link rel="stylesheet" href="css/style.css?v=4">
 </head>
 <body>
 
@@ -52,7 +62,7 @@
 
     <div class="ts-group">
       <div class="ts-buttons">
-        <button class="ts-btn" id="btnClear" data-icon="eraser" title="Smazat všechny proměnné (clear)">Vyčistit</button>
+        <button class="ts-btn" id="btnClear" data-icon="eraser" title="Smazat všechny proměnné a vyčistit Command Window (clear + clc). Historie příkazů ↑ ↓ zůstane.">Vyčistit</button>
         <div class="ts-stack">
           <label class="ts-field">Formát
             <select id="selFormat" title="Počet platných číslic ve výpisu">
@@ -71,6 +81,21 @@
         <button class="ts-btn" id="btnFigSettings" data-icon="sliders" title="Zobrazit / skrýt nastavení grafu">Nastavení</button>
       </div>
       <div class="ts-label">Graf</div>
+    </div>
+
+    <div class="ts-group">
+      <div class="ts-buttons">
+        <button class="ts-btn" id="btnDataImport" data-icon="import" title="Importovat textový soubor s daty (.txt, .csv, .dat)">Importovat</button>
+        <button class="ts-btn" id="btnData" data-icon="database" title="Okno Data – datasety, volby importu, pojmenování sloupců">Data</button>
+      </div>
+      <div class="ts-label">Data</div>
+    </div>
+
+    <div class="ts-group">
+      <div class="ts-buttons">
+        <button class="ts-btn" id="btnTheme" data-icon="moon" aria-pressed="false" title="Přepnout světlý / tmavý režim">Tmavý</button>
+      </div>
+      <div class="ts-label">Vzhled</div>
     </div>
 
     <div class="ts-spacer"></div>
@@ -147,16 +172,11 @@
             <button class="icon-btn" id="btnCopyData" data-icon="table" title="Kopírovat data grafu (pro Excel)"></button>
             <button class="txt-btn" id="btnPng" title="Stáhnout PNG">PNG</button>
             <button class="txt-btn" id="btnSvg" title="Stáhnout SVG (vektorově)">SVG</button>
-            <button class="icon-btn" id="btnFigSettings2" data-icon="sliders" title="Nastavení grafu"></button>
+            <button class="icon-btn" id="btnFigSettings2" data-icon="sliders" title="Nastavení grafu (zavře se klikem mimo nebo Esc)"></button>
           </span>
         </div>
         <div class="fig-body">
           <div class="fig-plot-wrap">
-            <div id="figDraft" hidden>
-              <span class="fd-dot"></span><span class="fd-text"></span>
-              <button class="btn primary" id="fdSave" title="Zapsat změny z panelu do kódu (Enter v poli, ⌘S)">Zapsat do kódu</button>
-              <button class="btn" id="fdCancel" title="Zahodit změny (Esc v poli)">Zrušit</button>
-            </div>
             <div id="figNotice" hidden></div>
             <div id="figPlot"></div>
             <div id="figEmpty" class="fig-empty">
@@ -167,11 +187,20 @@
               <p class="muted">Víc proměnných vybereš s ⌘ / Ctrl nebo Shift.</p>
             </div>
           </div>
-          <aside id="figSettings" aria-label="Nastavení grafu">
+          <aside id="figSettings" aria-label="Nastavení grafu" tabindex="-1">
             <div id="fsBar">
-              <span class="fsb-text">Změny se ukážou v náhledu</span>
-              <button class="btn" id="fsCancel" title="Zahodit změny (Esc v poli)" disabled>Zrušit</button>
-              <button class="btn primary" id="fsSave" title="Zapsat změny do kódu (Enter v poli, ⌘S)" disabled>Zapsat do kódu</button>
+              <div class="fsb-top">
+                <span class="fsb-text">Bez neuložených změn</span>
+                <button class="fsb-x" id="fsClose" title="Zavřít nastavení (Esc nebo klik mimo)" aria-label="Zavřít nastavení">×</button>
+              </div>
+              <div class="fsb-live">
+                <label class="fs-check" title="Změny v menu se hned ukážou v grafu. Vypnuto: graf se překreslí až tlačítkem Překreslit."><input type="checkbox" id="fsLive" checked> Živý náhled</label>
+                <button class="btn" id="fsRedraw" hidden title="Překreslit graf podle změn v menu (do kódu nic nezapíše)">↻ Překreslit</button>
+              </div>
+              <div class="fsb-btns">
+                <button class="btn" id="fsCancel" title="Vrátit graf do stavu před otevřením menu" disabled>Zrušit</button>
+                <button class="btn primary" id="fsSave" title="Zapsat změny do kódu (⌘S)" disabled>Zapsat do kódu</button>
+              </div>
             </div>
             <div id="fsBody"></div>
           </aside>
@@ -200,12 +229,14 @@
   <script src="vendor/codemirror/comment.js"></script>
   <script src="vendor/codemirror/active-line.js"></script>
   <script src="vendor/codemirror/show-hint.js"></script>
-  <script src="js/engine.js"></script>
-  <script src="js/graphics.js"></script>
-  <script src="js/examples.js"></script>
-  <script src="js/plot.js"></script>
-  <script src="js/plotcode.js"></script>
-  <script src="js/app.js"></script>
-  <script src="js/pwa.js"></script>
+  <script src="js/engine.js?v=4"></script>
+  <script src="js/graphics.js?v=4"></script>
+  <script src="js/data.js?v=4"></script>
+  <script src="js/examples.js?v=4"></script>
+  <script src="js/plot.js?v=4"></script>
+  <script src="js/plotcode.js?v=4"></script>
+  <script src="js/dataview.js?v=4"></script>
+  <script src="js/app.js?v=4"></script>
+  <script src="js/pwa.js?v=4"></script>
 </body>
 </html>

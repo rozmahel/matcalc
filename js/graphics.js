@@ -3,7 +3,11 @@
    ---------------------------------------------------------------------
    figure, hold, plot / semilogx / semilogy / loglog, title, xlabel,
    ylabel, legend, grid, box, xlim, ylim, axis, set(gca|gcf, …),
-   close, clf, cla.
+   yyaxis left/right (vedlejší osa Y), close, clf, cla.
+
+   S yyaxis mají vlastnosti osy Y dvě hodnoty (levá a pravá strana).
+   Příkazy ylabel, ylim, semilogy, axis, set(gca, 'YScale', …) mění
+   jen aktivní stranu – stejně jako v MATLABu.
 
    Příkazy jen mění stav grafů (gfx). Hodnoty se do grafu zkopírují
    ve chvíli volání plot – pozdější změna proměnné graf nezmění
@@ -24,7 +28,7 @@
   const COLOR_NAMES = { red: 'r', green: 'g', blue: 'b', cyan: 'c', magenta: 'm', yellow: 'y', black: 'k', white: 'w' };
 
   const FUNCS = new Set(['figure', 'hold', 'plot', 'semilogx', 'semilogy', 'loglog', 'title', 'xlabel', 'ylabel',
-    'legend', 'grid', 'box', 'xlim', 'ylim', 'axis', 'set', 'close', 'clf', 'cla', 'subplot']);
+    'legend', 'grid', 'box', 'xlim', 'ylim', 'axis', 'set', 'close', 'clf', 'cla', 'subplot', 'yyaxis']);
   const PLOT_FNS = new Set(['plot', 'semilogx', 'semilogy', 'loglog']);
 
   const LEGEND_LOCATIONS = ['north', 'south', 'east', 'west', 'northeast', 'northwest', 'southeast', 'southwest',
@@ -208,6 +212,12 @@
      ===================================================================== */
   function newState() { return { figs: [], cur: null }; }
 
+  // vlastnosti osy Y, které má každá strana zvlášť (yyaxis left / right)
+  const Y_KEYS = ['ylabel', 'ylim', 'yscale', 'ydir', 'ycolor', 'ytick', 'yminor', 'yminortick'];
+  function newSide() {
+    return { ylabel: null, ylim: null, yscale: 'linear', ydir: 'normal', ycolor: null, ytick: null, yminor: false, yminortick: false };
+  }
+
   function newAxes() {
     return {
       title: null, xlabel: null, ylabel: null,
@@ -219,11 +229,17 @@
       legend: null,                        // { visible, location, orientation, box, fontSize, title, … }
       fontSize: null, fontName: null, lineWidth: null, xcolor: null, ycolor: null,
       xtick: null, ytick: null, xminortick: false, yminortick: false,
-      lines: [],
+      lines: [],                           // křivky; ln.side = 'left' | 'right'
       touched: false,                      // osy existují (něco do nich zapsal příkaz)
       colorIdx: 0,
+      yyaxis: false,                       // má vedlejší (pravou) osu Y
+      side: 'left',                        // aktivní strana pro ylabel, ylim, YScale…
+      right: null,                         // vlastnosti pravé osy (newSide())
     };
   }
+
+  // objekt s vlastnostmi osy Y pro aktivní stranu (levá = přímo osy)
+  const ySide = (ax) => (ax.yyaxis && ax.side === 'right' && ax.right ? ax.right : ax);
 
   function nextNum(gfx) {
     let n = 1;
@@ -375,11 +391,15 @@
     if (nv.displayname) o.displayName = String(nv.displayname.v);
 
     const fig = curFig(ctx);
-    if (!fig.hold) { fig.ax = newAxes(); fig.ax.box = true; }
+    if (!fig.hold) {
+      // s yyaxis nahradí plot jen křivky aktivní strany (jako v MATLABu)
+      if (fig.ax.yyaxis) fig.ax.lines = fig.ax.lines.filter((ln) => (ln.side || 'left') !== fig.ax.side);
+      else { fig.ax = newAxes(); fig.ax.box = true; }
+    }
     const ax = fig.ax;
     ax.touched = true;
     if (fn === 'semilogx' || fn === 'loglog') ax.xscale = 'log';
-    if (fn === 'semilogy' || fn === 'loglog') ax.yscale = 'log';
+    if (fn === 'semilogy' || fn === 'loglog') ySide(ax).yscale = 'log';
     const legendOn = ax.legend && ax.legend.visible;
 
     series.forEach((s) => {
@@ -397,6 +417,7 @@
         mfc: o.mfc || 'none', mec: o.mec || 'auto',
         displayName: o.displayName || '',
         inLegend: true,
+        side: ax.yyaxis ? ax.side : 'left',
         fn, line: ctx.line,
       });
     });
@@ -413,7 +434,7 @@
     const fig = curFig(ctx);
     const ax = fig.ax;
     ax.touched = true;
-    if (i >= args.length) { ax[fn] = null; return fig; }
+    if (i >= args.length) { (fn === 'ylabel' ? ySide(ax) : ax)[fn] = null; return fig; }
     const a = args[i];
     let text;
     if (a.cell) text = a.v.join('\n');
@@ -434,7 +455,7 @@
       if (it === 'none' || it === 'tex') t.interp = it;
       else if (it === 'latex') { t.interp = 'tex'; ctx.warn(fn + ": Interpreter 'latex' zatím není – text se zobrazí jako TeX (^{…}, _{…}, \\alpha)"); } else ctx.warn(fn + ': neznámý Interpreter „' + nv.interpreter.v + '“ – ignorováno');
     }
-    ax[fn] = t;
+    (fn === 'ylabel' ? ySide(ax) : ax)[fn] = t;
     return fig;
   }
 
@@ -499,33 +520,38 @@
     const ax = fig.ax;
     ax.touched = true;
     const key = fn === 'xlim' ? 'xlim' : 'ylim';
+    const tgt = key === 'ylim' ? ySide(ax) : ax;
     const a = args[i];
     if (!a) return fig;
     if (isStr(a)) {
       const k = lc(a.v);
-      if (k === 'auto') ax[key] = null;
-      else if (k === 'tight') { const b = bounds(ax); const r = key === 'xlim' ? b.x : b.y; if (r) ax[key] = r; }
+      if (k === 'auto') tgt[key] = null;
+      else if (k === 'tight') { const b = bounds(ax); const r = key === 'xlim' ? b.x : b.y; if (r) tgt[key] = r; }
       else if (k !== 'manual' && k !== 'mode') ctx.warn(fn + ': neznámá volba „' + a.v + "“ – ignorováno (použij např. " + fn + '([0 10]) nebo ' + fn + " auto)");
       return fig;
     }
     const arr = numList(a.v);
     if (!arr || arr.length !== 2) throw gerr(fn + ': meze zadej jako dvojici [min max]', 'Např. ' + fn + '([0 10]). Pro automatickou mez použij -Inf nebo Inf.');
     if (!(arr[0] < arr[1])) throw gerr(fn + ': meze musí být rostoucí (min < max)', 'Např. ' + fn + '([0 10]).');
-    ax[key] = [arr[0], arr[1]];
+    tgt[key] = [arr[0], arr[1]];
     return fig;
   }
 
-  // rozsah dat ve všech křivkách (pro axis tight)
+  // rozsah dat (pro axis tight): x ze všech křivek, y z křivek aktivní strany
   function bounds(ax) {
+    const side = ax.yyaxis ? ax.side : 'left';
     const r = (k, log) => {
       let lo = Infinity;
       let hi = -Infinity;
-      ax.lines.forEach((ln) => ln[k].forEach((v) => { if (Number.isFinite(v) && (!log || v > 0)) { if (v < lo) lo = v; if (v > hi) hi = v; } }));
+      ax.lines.forEach((ln) => {
+        if (k === 'y' && (ln.side || 'left') !== side) return;
+        ln[k].forEach((v) => { if (Number.isFinite(v) && (!log || v > 0)) { if (v < lo) lo = v; if (v > hi) hi = v; } });
+      });
       if (!(lo <= hi)) return null;
       if (lo === hi) { const d = lo === 0 ? 1 : Math.abs(lo) * 0.1; return [lo - d, hi + d]; }
       return [lo, hi];
     };
-    return { x: r('x', ax.xscale === 'log'), y: r('y', ax.yscale === 'log') };
+    return { x: r('x', ax.xscale === 'log'), y: r('y', ySide(ax).yscale === 'log') };
   }
 
   function doAxis(call, args, ctx) {
@@ -538,12 +564,12 @@
       const a = args[i];
       if (isStr(a)) {
         const k = lc(a.v);
-        if (k === 'tight') { const b = bounds(ax); if (b.x) ax.xlim = b.x; if (b.y) ax.ylim = b.y; }
-        else if (k === 'auto') { ax.xlim = null; ax.ylim = null; }
+        if (k === 'tight') { const b = bounds(ax); if (b.x) ax.xlim = b.x; if (b.y) ySide(ax).ylim = b.y; }
+        else if (k === 'auto') { ax.xlim = null; ySide(ax).ylim = null; }
         else if (k === 'equal' || k === 'image') ax.equal = true;
         else if (k === 'normal') ax.equal = false;
-        else if (k === 'ij') ax.ydir = 'reverse';
-        else if (k === 'xy') ax.ydir = 'normal';
+        else if (k === 'ij') ySide(ax).ydir = 'reverse';
+        else if (k === 'xy') ySide(ax).ydir = 'normal';
         else if (k === 'off') ax.axisOff = true;
         else if (k === 'on') ax.axisOff = false;
         else if (k === 'square' || k === 'fill' || k === 'vis3d' || k === 'manual') ctx.warn("axis: volba '" + a.v + "' zatím není podporovaná – ignorováno");
@@ -555,7 +581,7 @@
       if (arr.length === 6) ctx.warn('axis: osa Z se ignoruje');
       if (!(arr[0] < arr[1]) || !(arr[2] < arr[3])) throw gerr('axis: meze musí být rostoucí (min < max)');
       ax.xlim = [arr[0], arr[1]];
-      ax.ylim = [arr[2], arr[3]];
+      ySide(ax).ylim = [arr[2], arr[3]];
     }
     return fig;
   }
@@ -574,30 +600,33 @@
     if (h.v.handle === 'gcf') { applyFigProps(fig, nv, 'set', ctx); return fig; }
     const ax = fig.ax;
     ax.touched = true;
+    const ys = ySide(ax);
     Object.keys(nv).forEach((k) => {
       const a = nv[k];
       const v = a.v;
       const bad = () => ctx.warn('set: neplatná hodnota pro ' + a.name + ' („' + a.text + '“) – ignorováno');
+      // vlastnosti osy Y patří aktivní straně (yyaxis)
+      const T = k[0] === 'y' && k !== 'ygrid' ? ys : ax;
       switch (k) {
         case 'xscale': case 'yscale': {
           const s = lc(v);
-          if (s === 'log' || s === 'linear') ax[k] = s; else bad();
+          if (s === 'log' || s === 'linear') T[k] = s; else bad();
           break;
         }
         case 'xlim': case 'ylim': {
           const arr = numList(v);
-          if (arr && arr.length === 2 && arr[0] < arr[1]) ax[k] = arr; else bad();
+          if (arr && arr.length === 2 && arr[0] < arr[1]) T[k] = arr; else bad();
           break;
         }
         case 'xgrid': case 'ygrid': case 'box': { const b = onOff(v); if (b === null) bad(); else ax[k] = b; break; }
-        case 'xminorgrid': case 'yminorgrid': { const b = onOff(v); if (b === null) bad(); else ax[k === 'xminorgrid' ? 'xminor' : 'yminor'] = b; break; }
-        case 'xminortick': case 'yminortick': { const b = onOff(v); if (b === null) bad(); else ax[k] = b; break; }
+        case 'xminorgrid': case 'yminorgrid': { const b = onOff(v); if (b === null) bad(); else T[k === 'xminorgrid' ? 'xminor' : 'yminor'] = b; break; }
+        case 'xminortick': case 'yminortick': { const b = onOff(v); if (b === null) bad(); else T[k] = b; break; }
         case 'fontsize': { const n = num1(v); if (n > 0) ax.fontSize = n; else bad(); break; }
         case 'fontname': if (typeof v === 'string') ax.fontName = v; else bad(); break;
         case 'linewidth': { const n = num1(v); if (n > 0) ax.lineWidth = n; else bad(); break; }
-        case 'xdir': case 'ydir': { const s = lc(v); if (s === 'normal' || s === 'reverse') ax[k] = s; else bad(); break; }
-        case 'xtick': case 'ytick': { const arr = numList(v); if (arr) ax[k] = arr.slice().sort((p, q) => p - q); else bad(); break; }
-        case 'xcolor': case 'ycolor': { const c = parseColor(v); if (c) ax[k] = c; else bad(); break; }
+        case 'xdir': case 'ydir': { const s = lc(v); if (s === 'normal' || s === 'reverse') T[k] = s; else bad(); break; }
+        case 'xtick': case 'ytick': { const arr = numList(v); if (arr) T[k] = arr.slice().sort((p, q) => p - q); else bad(); break; }
+        case 'xcolor': case 'ycolor': { const c = parseColor(v); if (c) T[k] = c; else bad(); break; }
         default:
           if (!AX_IGNORE.includes(k)) ctx.warn('set: vlastnost os „' + a.name + '“ zatím není podporovaná – ignorováno');
       }
@@ -676,6 +705,26 @@
     return fig;
   }
 
+  // yyaxis left / yyaxis right – vedlejší osa Y. První volání přidá pravou osu,
+  // dosavadní křivky zůstanou vlevo (jako v MATLABu).
+  function doYyaxis(call, args, ctx) {
+    let i = 0;
+    if (isHandle(args[0])) i = 1;
+    const a = args[i];
+    const k = a && isStr(a) ? lc(a.v) : '';
+    if (k !== 'left' && k !== 'right') throw gerr('yyaxis: zadej stranu left nebo right', 'Např. yyaxis right – další plot, ylabel a ylim patří pravé ose.');
+    const fig = curFig(ctx);
+    const ax = fig.ax;
+    ax.touched = true;
+    if (!ax.yyaxis) {
+      ax.yyaxis = true;
+      ax.right = newSide();
+      ax.lines.forEach((ln) => { ln.side = 'left'; });
+    }
+    ax.side = k;
+    return fig;
+  }
+
   function doClose(call, args, ctx) {
     const g = ctx.gfx;
     const a = args[0];
@@ -709,7 +758,12 @@
       case 'set': fig = doSet(call, args, ctx); break;
       case 'close': fig = doClose(call, args, ctx); break;
       case 'clf': fig = curFig(ctx); fig.ax = newAxes(); fig.hold = false; break;
-      case 'cla': fig = curFig(ctx); fig.ax.lines = []; fig.ax.colorIdx = 0; break;
+      case 'cla':
+        fig = curFig(ctx);
+        if (fig.ax.yyaxis) fig.ax.lines = fig.ax.lines.filter((ln) => (ln.side || 'left') !== fig.ax.side);   // jen aktivní strana
+        else { fig.ax.lines = []; fig.ax.colorIdx = 0; }
+        break;
+      case 'yyaxis': fig = doYyaxis(call, args, ctx); break;
       case 'subplot':
         fig = curFig(ctx);
         ctx.warn('subplot zatím není podporovaný – všechno se kreslí do jedné osy grafu');
@@ -720,7 +774,7 @@
   }
 
   MC.graphics = {
-    PALETTE, COLOR_LETTERS, LEGEND_LOCATIONS, MARKERS, PLOT_FNS, FUNCS,
+    PALETTE, COLOR_LETTERS, LEGEND_LOCATIONS, MARKERS, PLOT_FNS, FUNCS, Y_KEYS,
     parseCall, classify, splitArgs, parseSpec, parseColor,
     newState, exec,
   };
